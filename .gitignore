@@ -1,0 +1,51 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environments
+venv/
+venv311/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs and Execution Artifacts
+logs/
+*.log
+*.retry
+
+# Local Databases and Secrets
+jobs.db
+*.db
+*.sqlite
+*.sqlite3
+.master_key
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# Ansible & Temporary Files
+.ansible_tmp/
+.ansible/
+scratch/
+tmp/

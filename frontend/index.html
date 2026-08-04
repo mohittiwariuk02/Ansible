@@ -11,6 +11,38 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link rel="stylesheet" href="css/styles.css">
 </head>
+<!-- ===== LOGIN PORTAL OVERLAY ===== -->
+<div id="login-portal" class="login-overlay" style="display:flex;position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(11,15,25,0.95);backdrop-filter:blur(16px);z-index:99999;align-items:center;justify-content:center;">
+    <div class="login-card glass-card" style="max-width:440px;width:90%;padding:32px;border:1px solid rgba(255,255,255,0.1);border-radius:16px;box-shadow:0 25px 50px -12px rgba(0,0,0,0.5);">
+        <div class="login-header" style="text-align:center;margin-bottom:24px;">
+            <div class="brand-logo" style="width:60px;height:60px;margin:0 auto 12px;background:rgba(59,130,246,0.1);border:1px solid rgba(59,130,246,0.3);border-radius:16px;display:flex;align-items:center;justify-content:center;">
+                <i class="fa-solid fa-key" style="font-size:28px;color:var(--primary);"></i>
+            </div>
+            <h2 style="font-size:22px;font-weight:800;color:var(--text-main);margin:0;">SSH Manager</h2>
+            <p style="font-size:12px;color:var(--text-muted);margin:4px 0 0;">Enterprise Governance & Access Hub</p>
+        </div>
+        <form id="form-login">
+            <div class="form-group" style="margin-bottom:16px;">
+                <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;color:var(--text-main);">Username</label>
+                <input type="text" id="login-username" class="form-control" placeholder="e.g. admin or developer" required autocomplete="username" style="width:100%;padding:10px 14px;">
+            </div>
+            <div class="form-group" style="margin-bottom:20px;">
+                <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;color:var(--text-main);">Password</label>
+                <input type="password" id="login-password" class="form-control" placeholder="Enter password" required autocomplete="current-password" style="width:100%;padding:10px 14px;">
+            </div>
+            <div id="login-error-msg" style="margin-bottom:14px;color:var(--danger);font-size:12.5px;"></div>
+            <button type="submit" class="btn btn-primary" id="btn-submit-login" style="width:100%;padding:12px;font-size:14px;font-weight:700;justify-content:center;">
+                <i class="fa-solid fa-right-to-bracket"></i> Log In to Dashboard
+            </button>
+            <div style="margin-top:20px;padding:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:8px;font-size:11px;color:var(--text-muted);line-height:1.5;">
+                <strong style="color:var(--text-main);">Default Accounts:</strong><br>
+                • <strong>Administrator</strong>: <code>admin</code> / <code>admin123</code> (Full Write & Unmasked)<br>
+                • <strong>Developer</strong>: <code>developer</code> / <code>dev123</code> (Read-Only & Masked Keys)
+            </div>
+        </form>
+    </div>
+</div>
+
 <body>
 <div class="app-container">
 
@@ -92,6 +124,15 @@
                 <button class="btn btn-outline" id="btn-ping-all">
                     <i class="fa-solid fa-network-wired"></i> Test Ping
                 </button>
+                <div id="header-user-badge" style="display:flex;align-items:center;gap:10px;padding-left:12px;border-left:1px solid rgba(255,255,255,0.1);">
+                    <div style="text-align:right;">
+                        <div id="user-display-name" style="font-weight:700;font-size:13px;color:var(--text-main);">--</div>
+                        <span id="user-role-badge" class="badge badge-primary" style="font-size:9.5px;text-transform:uppercase;">ROLE</span>
+                    </div>
+                    <button class="btn btn-sm btn-outline" id="btn-header-logout" title="Log Out" style="color:var(--danger);border-color:rgba(239,68,68,0.3);padding:6px 10px;">
+                        <i class="fa-solid fa-right-from-bracket"></i> Logout
+                    </button>
+                </div>
             </div>
         </header>
 
@@ -437,23 +478,80 @@
             </div>
         </section>
 
-        <!-- ===== TAB 3: Managed Servers ===== -->
+        <!-- ===== TAB 3: Server Explorer ===== -->
         <section class="tab-content" id="tab-inventory">
             <div class="card glass-card">
-                <div class="card-header">
-                    <h3><i class="fa-solid fa-network-wired"></i> Managed Server Inventory</h3>
-                    <span class="badge badge-primary" id="inventory-count">0 Servers</span>
+                <div class="card-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <h3><i class="fa-solid fa-server" style="color:var(--primary);"></i> Server Explorer</h3>
+                        <span class="badge badge-primary" id="inventory-count">0 Servers</span>
+                        <span class="badge badge-success" id="explorer-online-count">0 Online</span>
+                    </div>
+                    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                        <button class="btn btn-outline btn-sm" id="btn-explorer-batch-ping">
+                            <i class="fa-solid fa-network-wired"></i> Batch Ping
+                        </button>
+                        <button class="btn btn-outline btn-sm" id="btn-explorer-bulk-sync">
+                            <i class="fa-solid fa-arrows-rotate"></i> Bulk Sync Selected
+                        </button>
+                        <button class="btn btn-primary btn-sm" id="btn-open-add-server-modal">
+                            <i class="fa-solid fa-plus-circle"></i> Add Server(s)
+                        </button>
+                    </div>
                 </div>
                 <div class="card-body">
+                    <!-- Advanced Filters Bar -->
+                    <div class="explorer-filters-bar" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;background:rgba(255,255,255,0.02);padding:14px;border-radius:10px;border:1px solid rgba(255,255,255,0.05);">
+                        <div style="flex:1;min-width:220px;">
+                            <input type="text" id="explorer-search-input" class="form-control" placeholder="Search Hostname, IP, Alias, Owner, Tags..." style="width:100%;">
+                        </div>
+                        <div style="width:150px;">
+                            <select id="explorer-filter-env" class="custom-select" style="width:100%;">
+                                <option value="all">All Environments</option>
+                                <option value="Production">Production</option>
+                                <option value="Staging">Staging</option>
+                                <option value="Development">Development</option>
+                                <option value="QA">QA</option>
+                            </select>
+                        </div>
+                        <div style="width:140px;">
+                            <select id="explorer-filter-region" class="custom-select" style="width:100%;">
+                                <option value="all">All Regions</option>
+                                <option value="us-east-1">us-east-1</option>
+                                <option value="ap-south-1">ap-south-1</option>
+                                <option value="eu-central-1">eu-central-1</option>
+                                <option value="on-prem-dc1">on-prem-dc1</option>
+                            </select>
+                        </div>
+                        <div style="width:140px;">
+                            <select id="explorer-filter-status" class="custom-select" style="width:100%;">
+                                <option value="all">All Health</option>
+                                <option value="online">Online Only</option>
+                                <option value="offline">Offline Only</option>
+                            </select>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:6px;">
+                            <button class="btn btn-outline btn-sm" id="btn-toggle-favorites" title="Favorites Only">
+                                <i class="fa-solid fa-star" style="color:#eab308;"></i>
+                            </button>
+                            <button class="btn btn-outline btn-sm" id="btn-reset-explorer-filters" title="Reset Filters">
+                                <i class="fa-solid fa-rotate-left"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Server Explorer Grid / Table -->
                     <div class="table-responsive">
-                        <table class="custom-table" id="inventory-table">
+                        <table class="custom-table" id="explorer-table">
                             <thead>
                                 <tr>
-                                    <th>Host</th>
+                                    <th style="width:40px;"><input type="checkbox" id="chk-explorer-select-all"></th>
+                                    <th>Server Host</th>
                                     <th>IP Address</th>
-                                    <th>Group</th>
+                                    <th>Environment & Region</th>
+                                    <th>Group / Owner</th>
+                                    <th>Health & Ping</th>
                                     <th>Users With SSH Access</th>
-                                    <th>Status</th>
                                     <th>Action</th>
                                 </tr>
                             </thead>
@@ -463,6 +561,57 @@
                 </div>
             </div>
         </section>
+
+        <!-- ===== Modal: Add Managed Server(s) ===== -->
+        <div class="modal-overlay" id="modal-add-server" style="display:none;z-index:9999;">
+            <div class="modal-card glass-card" style="max-width:560px;width:90%;">
+                <div class="modal-header" style="display:flex;justify-content:space-between;align-items:center;">
+                    <h3><i class="fa-solid fa-server" style="color:var(--primary);"></i> Add Managed Server(s)</h3>
+                    <button class="modal-close" id="btn-close-add-server-modal" style="background:none;border:none;color:var(--text-main);font-size:20px;cursor:pointer;">&times;</button>
+                </div>
+                <div class="modal-body" style="padding:20px;">
+                    <div style="display:flex;gap:10px;margin-bottom:16px;">
+                        <button type="button" class="btn btn-sm btn-primary" id="tab-btn-single-server">Single Server</button>
+                        <button type="button" class="btn btn-sm btn-outline" id="tab-btn-bulk-server">Bulk Add (Multiple)</button>
+                    </div>
+
+                    <!-- Single Form -->
+                    <div id="form-single-server">
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;">Server Host Alias <span style="color:var(--danger);">*</span></label>
+                            <input type="text" id="add-server-name" placeholder="e.g. serv4, node3, web02" class="form-control" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;">IP Address / Hostname <span style="color:var(--danger);">*</span></label>
+                            <input type="text" id="add-server-ip" placeholder="e.g. 172.0.16.87" class="form-control" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;">Inventory Group</label>
+                            <input type="text" id="add-server-group" value="web_servers" placeholder="e.g. web_servers" class="form-control" style="width:100%;">
+                        </div>
+                    </div>
+
+                    <!-- Bulk Form -->
+                    <div id="form-bulk-server" style="display:none;">
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;">Default Group</label>
+                            <input type="text" id="add-bulk-group" value="web_servers" placeholder="e.g. web_servers" class="form-control" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="margin-bottom:14px;">
+                            <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;">Paste Multiple Server Lines</label>
+                            <textarea id="add-bulk-text" rows="5" placeholder="serv4 ansible_host=172.0.16.87&#10;serv5 ansible_host=172.0.16.88&#10;node3 192.168.1.50" class="form-control" style="width:100%;font-family:monospace;font-size:12px;"></textarea>
+                            <span style="font-size:11px;color:var(--text-muted);margin-top:4px;display:block;">Format: <code>host_alias ansible_host=IP</code> (one per line)</span>
+                        </div>
+                    </div>
+
+                    <div id="add-server-status-msg" style="margin-top:10px;"></div>
+                </div>
+                <div class="modal-footer" style="display:flex;justify-content:flex-end;gap:10px;padding:16px;">
+                    <button class="btn btn-outline" id="btn-cancel-add-server">Cancel</button>
+                    <button class="btn btn-primary" id="btn-submit-add-server"><i class="fa-solid fa-plus-circle"></i> Save Server(s)</button>
+                </div>
+            </div>
+        </div>
 
         <!-- ===== TAB 4: Key Auditor ===== -->
         <section class="tab-content" id="tab-auditor">
@@ -775,6 +924,43 @@
                                 </thead>
                                 <tbody id="sync-history-table-body">
                                     <tr><td colspan="9" class="text-center" style="padding:16px;color:var(--text-muted);">Loading sync history...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Detailed Infrastructure Change History / Audit Trail -->
+                    <div style="margin-top:30px;background:rgba(255,255,255,0.02);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:18px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
+                            <h4 style="font-size:14px;font-weight:700;margin:0;color:var(--text-main);"><i class="fa-solid fa-clock-rotate-left" style="color:var(--primary);"></i> Infrastructure Change Audit Trail</h4>
+                            <div style="display:flex;gap:10px;align-items:center;">
+                                <select id="change-filter-type" class="custom-select" style="font-size:12px;padding:4px 8px;background:var(--bg-glass-input);">
+                                    <option value="all">All Change Categories</option>
+                                    <option value="NEW_USER">New User Discovered</option>
+                                    <option value="KEY_ADDED">SSH Key Added</option>
+                                    <option value="KEY_REMOVED">SSH Key Removed</option>
+                                    <option value="USER_REMOVED">User Removed</option>
+                                    <option value="SERVER_UNREACHABLE">Server Unreachable</option>
+                                </select>
+                                <button class="btn btn-outline btn-xs" id="btn-refresh-change-logs"><i class="fa-solid fa-rotate"></i> Refresh Changes</button>
+                            </div>
+                        </div>
+
+                        <div class="table-responsive">
+                            <table class="custom-table" style="font-size:12px;">
+                                <thead>
+                                    <tr>
+                                        <th>Timestamp</th>
+                                        <th>Sync Job ID</th>
+                                        <th>Operator</th>
+                                        <th>Server Host</th>
+                                        <th>Target User</th>
+                                        <th>Change Category</th>
+                                        <th>Change Description</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="sync-changes-table-body">
+                                    <tr><td colspan="7" class="text-center" style="padding:16px;color:var(--text-muted);">Loading infrastructure change audit trail...</td></tr>
                                 </tbody>
                             </table>
                         </div>

@@ -10,8 +10,10 @@ import uuid
 import base64
 import hashlib
 import math
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, Response, send_from_directory
+from datetime import datetime, date, timedelta
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask import Flask, request, jsonify, Response, send_from_directory, session
 from flask_cors import CORS
 
 import pymysql
@@ -53,7 +55,10 @@ VENV_ANSIBLE = os.path.join(BASE_DIR, "venv", "bin", "ansible-playbook")
 ANSIBLE_BIN = VENV_ANSIBLE if os.path.exists(VENV_ANSIBLE) else "ansible-playbook"
 
 app = Flask(__name__, static_folder=FRONTEND_DIR)
-CORS(app)
+app.secret_key = os.environ.get('SECRET_KEY', 'ansible_ssh_manager_super_secret_key_2026')
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+CORS(app, supports_credentials=True)
 
 JOB_LOGS = {}
 JOB_STATUS = {}
@@ -152,9 +157,193 @@ def init_db():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         ''')
 
+        # Enterprise Server Metadata Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS server_metadata (
+                host VARCHAR(255) PRIMARY KEY,
+                ip VARCHAR(255) DEFAULT '',
+                group_name VARCHAR(255) DEFAULT 'web_servers',
+                environment VARCHAR(50) DEFAULT 'Production',
+                region VARCHAR(100) DEFAULT 'us-east-1',
+                os_info VARCHAR(100) DEFAULT 'Linux',
+                tags VARCHAR(512) DEFAULT 'web,production',
+                owner VARCHAR(100) DEFAULT 'DevOps Team',
+                status VARCHAR(50) DEFAULT 'online',
+                is_favorite TINYINT(1) DEFAULT 0,
+                last_ping_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_synced_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_env (environment),
+                INDEX idx_region (region),
+                INDEX idx_group (group_name),
+                INDEX idx_status (status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
+
+        # Synchronization Change Audit Log Table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sync_change_log (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                job_id VARCHAR(64) NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                operator_name VARCHAR(255) DEFAULT 'Admin',
+                host VARCHAR(255) NOT NULL,
+                user VARCHAR(255) NOT NULL,
+                change_type VARCHAR(50) NOT NULL,
+                previous_value TEXT,
+                new_value TEXT,
+                description TEXT,
+                INDEX idx_job (job_id),
+                INDEX idx_host (host),
+                INDEX idx_user (user),
+                INDEX idx_type (change_type)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
+
+        # RBAC Tables
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS roles (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                role_name VARCHAR(50) UNIQUE NOT NULL,
+                description VARCHAR(255) DEFAULT ''
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS permissions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                perm_key VARCHAR(100) UNIQUE NOT NULL,
+                description VARCHAR(255) DEFAULT ''
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                role_id INT NOT NULL,
+                perm_id INT NOT NULL,
+                PRIMARY KEY (role_id, perm_id),
+                FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
+                FOREIGN KEY (perm_id) REFERENCES permissions(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS app_users (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(100) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                full_name VARCHAR(255) DEFAULT '',
+                role_id INT NOT NULL,
+                is_active TINYINT(1) DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (role_id) REFERENCES roles(id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ''')
+
+        # Seed Default Roles
+        cursor.execute("INSERT IGNORE INTO roles (id, role_name, description) VALUES (1, 'admin', 'Administrator with full system access'), (2, 'developer', 'Developer with read-only access and masked keys')")
+
+        # Seed Default Permissions
+        perms = [
+            (1, 'read:keys', 'View servers, users, and SSH key summaries'),
+            (2, 'write:keys', 'Add, edit, delete, enable, disable, and share SSH keys'),
+            (3, 'view:full_key', 'View complete unmasked SSH public keys'),
+            (4, 'manage:servers', 'Add and remove managed server hosts'),
+            (5, 'manage:users', 'Manage dashboard user accounts and role assignments'),
+            (6, 'trigger:sync', 'Initiate background SSH key synchronization')
+        ]
+        for pid, pkey, pdesc in perms:
+            cursor.execute("INSERT IGNORE INTO permissions (id, perm_key, description) VALUES (%s, %s, %s)", (pid, pkey, pdesc))
+
+        # Assign All Permissions to Admin Role (1)
+        for pid in range(1, 7):
+            cursor.execute("INSERT IGNORE INTO role_permissions (role_id, perm_id) VALUES (1, %s)", (pid,))
+
+        # Assign Read-Only & Sync Permissions to Developer Role (2)
+        cursor.execute("INSERT IGNORE INTO role_permissions (role_id, perm_id) VALUES (2, 1)")
+        cursor.execute("INSERT IGNORE INTO role_permissions (role_id, perm_id) VALUES (2, 6)")
+
+        # Seed Default Admin User ('admin' / 'admin123')
+        admin_hash = generate_password_hash('admin123')
+        cursor.execute("INSERT IGNORE INTO app_users (username, password_hash, full_name, role_id, is_active) VALUES ('admin', %s, 'Administrator', 1, 1)", (admin_hash,))
+
         conn.close()
     except Exception as e:
         print(f"Notice initializing MySQL database: {e}")
+
+def mask_ssh_key(key_str):
+    """Mask SSH key body so complete key is never exposed to Developer role."""
+    if not key_str or not isinstance(key_str, str):
+        return ""
+    parts = key_str.strip().split()
+    if len(parts) < 2:
+        return key_str[:8] + "...[MASKED]..."
+    algo = parts[0]
+    body = parts[1]
+    comment = " ".join(parts[2:]) if len(parts) >= 3 else ""
+
+    if len(body) <= 24:
+        masked_body = body[:6] + "...[MASKED]..." + body[-6:]
+    else:
+        masked_body = body[:12] + "...[MASKED]..." + body[-12:]
+
+    return f"{algo} {masked_body}" + (f" {comment}" if comment else "")
+
+def get_user_permissions(user_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT p.perm_key
+        FROM app_users u
+        JOIN role_permissions rp ON u.role_id = rp.role_id
+        JOIN permissions p ON rp.perm_id = p.id
+        WHERE u.id = %s AND u.is_active = 1
+    ''', (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return {r['perm_key'] for r in rows}
+
+def get_current_user():
+    user_id = session.get('user_id')
+    if not user_id:
+        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.id, u.username, u.full_name, u.role_id, r.role_name
+        FROM app_users u
+        JOIN roles r ON u.role_id = r.id
+        WHERE u.id = %s AND u.is_active = 1
+    ''', (user_id,))
+    user = cursor.fetchone()
+    conn.close()
+    if user:
+        user['permissions'] = list(get_user_permissions(user['id']))
+    return user
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Authentication required. Please log in.", "code": "UNAUTHORIZED"}), 401
+        request.current_user = user
+        return f(*args, **kwargs)
+    return decorated
+
+def require_perm(perm_key):
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({"error": "Authentication required. Please log in.", "code": "UNAUTHORIZED"}), 401
+            perms = user.get('permissions', [])
+            if perm_key not in perms:
+                return jsonify({"error": f"Permission denied. Required permission: '{perm_key}'.", "code": "FORBIDDEN"}), 403
+            request.current_user = user
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
 
 def sync_access_cache_to_ssh_key_cache():
     """Seed ssh_key_cache from access_cache keys_text upon startup."""
@@ -208,9 +397,35 @@ def get_env():
     env = os.environ.copy()
     env["ANSIBLE_LOCAL_TEMP"] = os.path.join(BASE_DIR, ".ansible_tmp", "local")
     env["ANSIBLE_HOST_KEY_CHECKING"] = "False"
+    env["ANSIBLE_SSH_COMMON_ARGS"] = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
     env["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
     env["PYTHONUNBUFFERED"] = "1"
     return env
+
+def safe_b64decode_bytes(s):
+    """Safely decode base64 string into bytes, fixing padding and stripping whitespace/corrupt characters."""
+    if not s or not isinstance(s, str):
+        return b""
+    clean_s = s.strip().replace(' ', '').replace('\n', '').replace('\r', '').replace('\\n', '').replace('\\r', '')
+    if not clean_s or clean_s.lower() in ("none", "null"):
+        return b""
+    missing_padding = len(clean_s) % 4
+    if missing_padding == 1:
+        clean_s = clean_s[:-1]
+    elif missing_padding > 1:
+        clean_s += '=' * (4 - missing_padding)
+    try:
+        return base64.b64decode(clean_s)
+    except Exception as e:
+        print(f"Notice: safe_b64decode_bytes fallback: {e}")
+        return b""
+
+def safe_b64decode(s):
+    """Safely decode base64 string into UTF-8 text, fixing padding and stripping whitespace/corrupt characters."""
+    raw_bytes = safe_b64decode_bytes(s)
+    if not raw_bytes:
+        return ""
+    return raw_bytes.decode('utf-8', errors='ignore').strip()
 
 def compute_ssh_fingerprint(key_str):
     if not key_str or not isinstance(key_str, str):
@@ -219,7 +434,9 @@ def compute_ssh_fingerprint(key_str):
     if len(parts) < 2:
         return "N/A"
     try:
-        raw_key = base64.b64decode(parts[1])
+        raw_key = safe_b64decode_bytes(parts[1])
+        if not raw_key:
+            return "N/A"
         fp = hashlib.sha256(raw_key).digest()
         encoded_fp = base64.b64encode(fp).decode('ascii').rstrip('=')
         return f"SHA256:{encoded_fp}"
@@ -608,7 +825,117 @@ def ping_servers():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# Auth & Session Routes
+@app.route('/api/auth/login', methods=['POST'])
+def login():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.id, u.username, u.password_hash, u.full_name, u.role_id, r.role_name, u.is_active
+        FROM app_users u
+        JOIN roles r ON u.role_id = r.id
+        WHERE u.username = %s
+    ''', (username,))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user or not user['is_active'] or not check_password_hash(user['password_hash'], password):
+        return jsonify({"error": "Invalid username or password."}), 401
+
+    session.permanent = True
+    session['user_id'] = user['id']
+    session['username'] = user['username']
+    session['role'] = user['role_name']
+
+    perms = list(get_user_permissions(user['id']))
+
+    return jsonify({
+        "status": "success",
+        "message": f"Welcome back, {user['full_name']}!",
+        "user": {
+            "id": user['id'],
+            "username": user['username'],
+            "full_name": user['full_name'],
+            "role": user['role_name'],
+            "permissions": perms
+        }
+    })
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return jsonify({"status": "success", "message": "Successfully logged out."})
+
+@app.route('/api/auth/me', methods=['GET'])
+def auth_me():
+    user = get_current_user()
+    if not user:
+        return jsonify({"authenticated": False}), 200
+    return jsonify({
+        "authenticated": True,
+        "user": {
+            "id": user['id'],
+            "username": user['username'],
+            "full_name": user['full_name'],
+            "role": user['role_name'],
+            "permissions": user['permissions']
+        }
+    })
+
+@app.route('/api/users', methods=['GET'])
+@require_perm('manage:users')
+def list_dashboard_users():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT u.id, u.username, u.full_name, u.role_id, r.role_name, u.is_active, u.created_at
+        FROM app_users u
+        JOIN roles r ON u.role_id = r.id
+        ORDER BY u.id ASC
+    ''')
+    users = cursor.fetchall()
+    conn.close()
+    for u in users:
+        u['created_at'] = format_dt(u.get('created_at'))
+    return jsonify(users)
+
+@app.route('/api/users/create', methods=['POST'])
+@require_perm('manage:users')
+def create_dashboard_user():
+    data = request.json or {}
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    full_name = data.get('full_name', '').strip() or username
+    role_id = int(data.get('role_id', 2))
+
+    if not username or not password:
+        return jsonify({"error": "Username and password are required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM app_users WHERE username = %s", (username,))
+    if cursor.fetchone():
+        conn.close()
+        return jsonify({"error": f"Username '{username}' already exists."}), 400
+
+    pwd_hash = generate_password_hash(password)
+    cursor.execute('''
+        INSERT INTO app_users (username, password_hash, full_name, role_id, is_active)
+        VALUES (%s, %s, %s, %s, 1)
+    ''', (username, pwd_hash, full_name, role_id))
+    conn.close()
+
+    return jsonify({"status": "success", "message": f"User '{username}' created successfully."})
+
 @app.route('/api/keys/deploy', methods=['POST'])
+@require_perm('write:keys')
 def deploy_key():
     data = request.json or {}
     target_hosts = data.get('target_hosts', [])
@@ -701,35 +1028,6 @@ def deploy_key():
         "fingerprint": fingerprint,
         "expires_at": expires_at_iso
     })
-
-@app.route('/api/jobs', methods=['GET'])
-def get_jobs():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, DATE_FORMAT(timestamp, '%%Y-%%m-%%d %%H:%%i:%%s') as timestamp, action, target_user, target_hosts, key_comment, operator_name, key_fingerprint, status, duration, expires_at FROM job_history ORDER BY timestamp DESC LIMIT 100")
-    jobs = cursor.fetchall()
-    conn.close()
-    return jsonify(jobs)
-
-@app.route('/api/jobs/<job_id>', methods=['GET'])
-def get_job_details(job_id):
-    if job_id in JOB_LOGS:
-        return jsonify({
-            "id": job_id,
-            "status": JOB_STATUS.get(job_id, "RUNNING"),
-            "logs": "".join(JOB_LOGS[job_id])
-        })
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, DATE_FORMAT(timestamp, '%%Y-%%m-%%d %%H:%%i:%%s') as timestamp, action, target_user, target_hosts, key_comment, operator_name, key_fingerprint, status, logs, duration, expires_at FROM job_history WHERE id = %s", (job_id,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if row:
-        return jsonify(row)
-    else:
-        return jsonify({"error": "Job not found"}), 404
 
 @app.route('/api/matrix', methods=['GET'])
 def get_access_matrix():
@@ -838,10 +1136,7 @@ def get_access_matrix():
                 keys_b64 = data.get('keys_b64', '').strip()
                 keys_text = ""
                 if keys_b64:
-                    try:
-                        keys_text = base64.b64decode(keys_b64).decode('utf-8', errors='ignore').strip()
-                    except Exception:
-                        keys_text = ""
+                    keys_text = safe_b64decode(keys_b64)
 
                 keys_list = parse_authorized_keys_text(keys_text)
                 final_count = len(keys_list) if keys_list else count
@@ -898,6 +1193,7 @@ def get_access_matrix():
         return jsonify({"error": str(e), "inventory": inventory}), 500
 
 @app.route('/api/keys/grant_access', methods=['POST'])
+@require_perm('write:keys')
 def grant_access():
     data = request.json or {}
     target_user = data.get('target_user', '').strip()
@@ -932,7 +1228,7 @@ def grant_access():
                     p_data = dict(p.split('=', 1) for p in parts[1:] if '=' in p)
                     kb64 = p_data.get('keys_b64', '').strip()
                     if kb64:
-                        ssh_key = base64.b64decode(kb64).decode('utf-8', errors='ignore').strip()
+                        ssh_key = safe_b64decode(kb64)
                         break
         except Exception as e:
             print(f"Error fetching live key from {source_host}: {e}")
@@ -982,7 +1278,29 @@ def grant_access():
         "expires_at": expires_at_iso
     })
 
+@app.route('/api/servers/users', methods=['GET'])
+@require_perm('read:keys')
+def get_server_users():
+    host = request.args.get('host', '').strip()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if host and host != 'all':
+        cursor.execute("SELECT DISTINCT user FROM access_cache WHERE host = %s AND status = 'active' ORDER BY user ASC", (host,))
+        rows = cursor.fetchall()
+        if not rows:
+            cursor.execute("SELECT DISTINCT user FROM ssh_key_cache WHERE host = %s ORDER BY user ASC", (host,))
+            rows = cursor.fetchall()
+    else:
+        cursor.execute("SELECT DISTINCT user FROM access_cache WHERE status = 'active' ORDER BY user ASC")
+        rows = cursor.fetchall()
+
+    conn.close()
+    users = sorted(list(set([r['user'] for r in rows if r.get('user')])))
+    return jsonify({"host": host or "all", "users": users})
+
 @app.route('/api/keys/copy_cross_server', methods=['POST'])
+@require_perm('write:keys')
 def copy_cross_server_key():
     data = request.json or {}
     source_host = data.get('source_host', '').strip()
@@ -998,6 +1316,17 @@ def copy_cross_server_key():
         return jsonify({"error": "Destination server host is required."}), 400
     if not ssh_key:
         return jsonify({"error": "No SSH key provided to copy."}), 400
+
+    if dest_host and dest_host != 'all' and dest_user != 'root':
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) as cnt FROM access_cache WHERE host=%s AND user=%s", (dest_host, dest_user))
+        c1 = cursor.fetchone()['cnt']
+        cursor.execute("SELECT COUNT(*) as cnt FROM ssh_key_cache WHERE host=%s AND user=%s", (dest_host, dest_user))
+        c2 = cursor.fetchone()['cnt']
+        conn.close()
+        if c1 == 0 and c2 == 0:
+            return jsonify({"error": f"Destination user account '{dest_user}' does not exist on server '{dest_host}' in database inventory. Please run a Sync or select a valid server user."}), 400
 
     key_parts = ssh_key.strip().split()
     target_key_body = key_parts[1] if len(key_parts) >= 2 else ssh_key.strip()
@@ -1164,6 +1493,7 @@ def share_validate_keys():
     })
 
 @app.route('/api/keys/share_execute', methods=['POST'])
+@require_perm('write:keys')
 def share_execute_keys():
     data = request.json or {}
     source_host = data.get('source_host', '').strip()
@@ -1220,6 +1550,346 @@ def share_execute_keys():
         "target_user": dest_user,
         "target_hosts": target_hosts_pattern
     })
+
+def format_dt(val):
+    """Format datetime objects or strings into clean YYYY-MM-DD HH:MM:SS format."""
+    if not val:
+        return "Never"
+    if isinstance(val, (datetime, date)):
+        return val.strftime("%Y-%m-%d %H:%M:%S")
+    val_str = str(val).strip()
+    if val_str.startswith("%Y") or not val_str or val_str.lower() in ("none", "null"):
+        return "Just now"
+    return val_str
+
+def add_servers_to_inventory(servers_data, default_group="web_servers"):
+    if not os.path.exists(INVENTORY_PATH):
+        with open(INVENTORY_PATH, "w") as f:
+            f.write(f"[{default_group}]\n")
+
+    with open(INVENTORY_PATH, "r") as f:
+        content = f.read()
+
+    lines = content.splitlines()
+    existing_parsed = parse_inventory(INVENTORY_PATH)
+    existing_names = {h["name"] for h in existing_parsed["all_hosts"]}
+
+    new_added = []
+    grouped = {}
+
+    for item in servers_data:
+        if isinstance(item, dict):
+            name = item.get("name", "").strip()
+            ip = item.get("ip", "").strip()
+            group = item.get("group", "").strip() or default_group
+            if not name or name in existing_names:
+                continue
+            line_str = f"{name} ansible_host={ip}" if ip else name
+        elif isinstance(item, str):
+            line_clean = item.strip()
+            if not line_clean or line_clean.startswith('#') or line_clean.startswith('['):
+                continue
+            parts = line_clean.split()
+            name = parts[0]
+            if name in existing_names:
+                continue
+            line_str = line_clean
+            group = default_group
+        else:
+            continue
+
+        existing_names.add(name)
+        new_added.append(name)
+        if group not in grouped:
+            grouped[group] = []
+        grouped[group].append(line_str)
+
+    if not new_added:
+        return new_added
+
+    new_content_lines = []
+    written_groups = set()
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            grp = stripped[1:-1].split(":")[0]
+            written_groups.add(grp)
+            new_content_lines.append(line)
+            if grp in grouped:
+                for new_line in grouped[grp]:
+                    new_content_lines.append(new_line)
+                del grouped[grp]
+        else:
+            new_content_lines.append(line)
+
+    for grp, grp_lines in grouped.items():
+        new_content_lines.append(f"\n[{grp}]")
+        new_content_lines.extend(grp_lines)
+
+    with open(INVENTORY_PATH, "w") as f:
+        f.write("\n".join(new_content_lines) + "\n")
+
+    return new_added
+
+def remove_server_from_inventory(host_name):
+    if not os.path.exists(INVENTORY_PATH):
+        return False
+    with open(INVENTORY_PATH, "r") as f:
+        lines = f.readlines()
+    
+    new_lines = []
+    removed = False
+    for line in lines:
+        parts = line.strip().split()
+        if parts and parts[0] == host_name:
+            removed = True
+            continue
+        new_lines.append(line)
+
+    if removed:
+        with open(INVENTORY_PATH, "w") as f:
+            f.writelines(new_lines)
+    return removed
+
+@app.route('/api/servers/add', methods=['POST'])
+@require_perm('manage:servers')
+def add_servers():
+    data = request.json or {}
+    servers = data.get('servers', [])
+    bulk_text = data.get('bulk_text', '').strip()
+    group = data.get('group', 'web_servers').strip() or 'web_servers'
+
+    servers_to_add = []
+    if bulk_text:
+        for line in bulk_text.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and not line.startswith('['):
+                servers_to_add.append(line)
+    elif servers:
+        for s in servers:
+            if isinstance(s, dict) and s.get('name'):
+                servers_to_add.append(s)
+            elif isinstance(s, str) and s.strip():
+                servers_to_add.append(s.strip())
+
+    if not servers_to_add:
+        return jsonify({"error": "No valid server data provided."}), 400
+
+    added_hosts = add_servers_to_inventory(servers_to_add, default_group=group)
+
+    if not added_hosts:
+        return jsonify({"status": "warning", "message": "Server(s) already exist in inventory.ini or no new host was added.", "inventory": parse_inventory(INVENTORY_PATH)}), 200
+
+    for h in added_hosts:
+        update_access_cache(h, 'root', 0, status='none', keys_text='')
+
+    return jsonify({
+        "status": "success",
+        "message": f"Successfully added {len(added_hosts)} server(s) ({', '.join(added_hosts)}) to inventory.ini!",
+        "added_hosts": added_hosts,
+        "inventory": parse_inventory(INVENTORY_PATH)
+    })
+
+def sync_inventory_to_server_metadata():
+    try:
+        inv = parse_inventory(INVENTORY_PATH)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        for host_info in inv["all_hosts"]:
+            name = host_info["name"]
+            ip = host_info["ip"]
+            grp = host_info["group"]
+            cursor.execute('''
+                INSERT INTO server_metadata (host, ip, group_name, environment, region, os_info, tags, owner, status, is_favorite, last_ping_at, last_synced_at)
+                VALUES (%s, %s, %s, 'Production', 'us-east-1', 'Linux', 'web,production', 'DevOps Team', 'online', 0, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE
+                    ip = VALUES(ip),
+                    group_name = VALUES(group_name)
+            ''', (name, ip, grp))
+        conn.close()
+    except Exception as e:
+        print(f"Notice sync_inventory_to_server_metadata: {e}")
+
+@app.route('/api/servers/explorer', methods=['GET'])
+@require_perm('read:keys')
+def get_server_explorer():
+    sync_inventory_to_server_metadata()
+    
+    q = request.args.get('q', '').strip()
+    env = request.args.get('env', '').strip()
+    region = request.args.get('region', '').strip()
+    group = request.args.get('group', '').strip()
+    status_filter = request.args.get('status', '').strip()
+    favorites_only = request.args.get('favorites', 'false').lower() == 'true'
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = []
+    params = []
+
+    if q:
+        q_wild = f"%{q}%"
+        where_clauses.append("(host LIKE %s OR ip LIKE %s OR group_name LIKE %s OR owner LIKE %s OR tags LIKE %s)")
+        params.extend([q_wild, q_wild, q_wild, q_wild, q_wild])
+
+    if env and env.lower() != 'all':
+        where_clauses.append("environment = %s")
+        params.append(env)
+
+    if region and region.lower() != 'all':
+        where_clauses.append("region = %s")
+        params.append(region)
+
+    if group and group.lower() != 'all':
+        where_clauses.append("group_name = %s")
+        params.append(group)
+
+    if status_filter and status_filter.lower() != 'all':
+        where_clauses.append("status = %s")
+        params.append(status_filter)
+
+    if favorites_only:
+        where_clauses.append("is_favorite = 1")
+
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    cursor.execute(f"SELECT * FROM server_metadata{where_sql} ORDER BY is_favorite DESC, host ASC", params)
+    servers = cursor.fetchall()
+
+    for s in servers:
+        s['last_ping_at'] = format_dt(s.get('last_ping_at'))
+        s['last_synced_at'] = format_dt(s.get('last_synced_at'))
+
+    cursor.execute("SELECT COUNT(*) as total, SUM(IF(status='online', 1, 0)) as online_cnt, SUM(IF(environment='Production', 1, 0)) as prod_cnt, SUM(IF(environment='Staging', 1, 0)) as staging_cnt, SUM(IF(environment='Development', 1, 0)) as dev_cnt, SUM(IF(environment='QA', 1, 0)) as qa_cnt FROM server_metadata")
+    stats = cursor.fetchone() or {}
+
+    conn.close()
+
+    return jsonify({
+        "servers": servers,
+        "total_servers": stats.get('total', 0) or 0,
+        "online_servers": stats.get('online_cnt', 0) or 0,
+        "stats": {
+            "production": stats.get('prod_cnt', 0) or 0,
+            "staging": stats.get('staging_cnt', 0) or 0,
+            "development": stats.get('dev_cnt', 0) or 0,
+            "qa": stats.get('qa_cnt', 0) or 0
+        }
+    })
+
+@app.route('/api/servers/metadata', methods=['POST'])
+@require_perm('manage:servers')
+def update_server_metadata():
+    data = request.json or {}
+    host = data.get('host', '').strip()
+    if not host:
+        return jsonify({"error": "host parameter is required."}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if 'is_favorite' in data:
+        fav = 1 if data['is_favorite'] else 0
+        cursor.execute("UPDATE server_metadata SET is_favorite = %s WHERE host = %s", (fav, host))
+
+    if 'environment' in data:
+        cursor.execute("UPDATE server_metadata SET environment = %s WHERE host = %s", (data['environment'], host))
+
+    if 'region' in data:
+        cursor.execute("UPDATE server_metadata SET region = %s WHERE host = %s", (data['region'], host))
+
+    if 'owner' in data:
+        cursor.execute("UPDATE server_metadata SET owner = %s WHERE host = %s", (data['owner'], host))
+
+    if 'tags' in data:
+        cursor.execute("UPDATE server_metadata SET tags = %s WHERE host = %s", (data['tags'], host))
+
+    conn.close()
+    return jsonify({"status": "success", "message": f"Updated metadata for server '{host}'."})
+
+@app.route('/api/servers/ping_batch', methods=['POST'])
+@require_perm('read:keys')
+def ping_batch():
+    data = request.json or {}
+    hosts = data.get('hosts', [])
+    if not hosts:
+        inv = parse_inventory(INVENTORY_PATH)
+        hosts = [h['name'] for h in inv['all_hosts']]
+
+    ansible_cmd = os.path.join(BASE_DIR, "venv", "bin", "ansible") if os.path.exists(os.path.join(BASE_DIR, "venv", "bin", "ansible")) else "ansible"
+    limit_pattern = ",".join(hosts)
+    cmd = [ansible_cmd, limit_pattern, "-i", INVENTORY_PATH, "-m", "ping"]
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    results = {}
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=BASE_DIR, env=get_env(), timeout=30)
+        output = res.stdout
+
+        for h in hosts:
+            if f"{h} | SUCCESS" in output:
+                status = "online"
+            elif f"{h} | UNREACHABLE" in output or f"{h} | FAILED" in output:
+                status = "offline"
+            else:
+                status = "online"
+            results[h] = status
+            cursor.execute("UPDATE server_metadata SET status = %s, last_ping_at = NOW() WHERE host = %s", (status, h))
+        conn.close()
+        return jsonify({"status": "completed", "results": results, "raw_output": output})
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/servers/remove', methods=['POST'])
+@require_perm('manage:servers')
+def remove_server():
+    data = request.json or {}
+    host = data.get('host', '').strip()
+    if not host:
+        return jsonify({"error": "host parameter is required."}), 400
+
+    removed = remove_server_from_inventory(host)
+    if removed:
+        return jsonify({"status": "success", "message": f"Server '{host}' removed from inventory.ini.", "inventory": parse_inventory(INVENTORY_PATH)})
+    else:
+        return jsonify({"error": f"Server '{host}' not found in inventory.ini."}), 404
+
+@app.route('/api/jobs', methods=['GET'])
+def get_jobs():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, timestamp, action, target_user, target_hosts, key_comment, operator_name, key_fingerprint, status, duration, expires_at FROM job_history ORDER BY timestamp DESC LIMIT 100")
+    jobs = cursor.fetchall()
+    conn.close()
+    for j in jobs:
+        j['timestamp'] = format_dt(j.get('timestamp'))
+    return jsonify(jobs)
+
+@app.route('/api/jobs/<job_id>', methods=['GET'])
+def get_job_details(job_id):
+    if job_id in JOB_LOGS:
+        return jsonify({
+            "id": job_id,
+            "status": JOB_STATUS.get(job_id, "RUNNING"),
+            "logs": "".join(JOB_LOGS[job_id])
+        })
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, timestamp, action, target_user, target_hosts, key_comment, operator_name, key_fingerprint, status, logs, duration, expires_at FROM job_history WHERE id = %s", (job_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        row['timestamp'] = format_dt(row.get('timestamp'))
+        return jsonify(row)
+    else:
+        return jsonify({"error": "Job not found"}), 404
 
 @app.route('/api/search/global', methods=['GET'])
 def global_search():
@@ -1286,23 +1956,29 @@ def global_search():
     total_matches = row_count['cnt'] if row_count else 0
 
     offset = (page - 1) * per_page
-    cursor.execute(f"SELECT id, host, user, home_dir, algorithm, raw_key, fingerprint, comment, status, is_duplicate, DATE_FORMAT(last_synced_at, '%%Y-%%m-%%d %%H:%%i:%%s') as last_synced_at FROM ssh_key_cache{where_sql} ORDER BY {col_name} {sort_dir} LIMIT %s OFFSET %s", params + [per_page, offset])
+    cursor.execute(f"SELECT id, host, user, home_dir, algorithm, raw_key, fingerprint, comment, status, is_duplicate, last_synced_at FROM ssh_key_cache{where_sql} ORDER BY {col_name} {sort_dir} LIMIT %s OFFSET %s", params + [per_page, offset])
     rows = cursor.fetchall()
+
+    user = get_current_user()
+    user_perms = user.get('permissions', []) if user else []
+    can_view_full = 'view:full_key' in user_perms
 
     results = []
     for r in rows:
+        raw_k = r["raw_key"] if can_view_full else mask_ssh_key(r["raw_key"])
         results.append({
             "id": r["id"],
             "host": r["host"],
             "user": r["user"],
             "home_dir": r["home_dir"] or (f"/root" if r["user"] == 'root' else f"/home/{r['user']}"),
             "algorithm": r["algorithm"],
-            "raw_key": r["raw_key"],
+            "raw_key": raw_k,
             "fingerprint": r["fingerprint"],
             "comment": r["comment"],
             "status": "duplicate" if r["is_duplicate"] else r["status"],
             "is_duplicate": bool(r["is_duplicate"]),
-            "last_synced_at": str(r["last_synced_at"]) if r["last_synced_at"] else "Just now"
+            "last_synced_at": format_dt(r.get("last_synced_at")),
+            "can_copy_full": can_view_full
         })
 
     cursor.execute("SELECT COUNT(DISTINCT host) as cnt FROM ssh_key_cache")
@@ -1340,9 +2016,9 @@ def sync_status():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT DATE_FORMAT(MAX(ended_at), '%%Y-%%m-%%d %%H:%%i:%%s') as max_ended FROM sync_history WHERE status = 'SUCCESS'")
+    cursor.execute("SELECT MAX(ended_at) as max_ended FROM sync_history WHERE status = 'SUCCESS'")
     row_sync = cursor.fetchone()
-    last_global_sync = str(row_sync['max_ended']) if row_sync and row_sync.get('max_ended') else "Never"
+    last_global_sync = format_dt(row_sync['max_ended']) if row_sync else "Never"
 
     cursor.execute("SELECT COUNT(*) as cnt FROM ssh_key_cache")
     total_keys = cursor.fetchone()['cnt']
@@ -1356,10 +2032,13 @@ def sync_status():
     cursor.execute("SELECT COUNT(*) as cnt FROM ssh_key_cache WHERE is_duplicate = 1")
     duplicate_keys = cursor.fetchone()['cnt']
 
-    cursor.execute("SELECT id, job_id, sync_mode, target_hosts, operator_name, DATE_FORMAT(started_at, '%%Y-%%m-%%d %%H:%%i:%%s') as started_at, DATE_FORMAT(ended_at, '%%Y-%%m-%%d %%H:%%i:%%s') as ended_at, status, servers_processed, users_scanned, keys_added, failures, execution_time_sec FROM sync_history ORDER BY id DESC LIMIT 10")
+    cursor.execute("SELECT id, job_id, sync_mode, target_hosts, operator_name, started_at, ended_at, status, servers_processed, users_scanned, keys_added, failures, execution_time_sec FROM sync_history ORDER BY id DESC LIMIT 10")
     history_rows = cursor.fetchall()
-
     conn.close()
+
+    for h in history_rows:
+        h['started_at'] = format_dt(h.get('started_at'))
+        h['ended_at'] = format_dt(h.get('ended_at'))
 
     return jsonify({
         "last_global_sync": last_global_sync,
@@ -1373,6 +2052,7 @@ def sync_status():
     })
 
 @app.route('/api/sync/start', methods=['POST'])
+@require_perm('trigger:sync')
 def sync_start():
     data = request.json or {}
     sync_mode = data.get('sync_mode', 'full').strip()
@@ -1414,10 +2094,115 @@ def sync_start():
         "message": f"Background synchronization started for {target_hosts_pattern}."
     })
 
+def parse_ansible_play_recap(output_text):
+    if not output_text:
+        return {
+            'total_hosts': 0, 'ok_hosts': 0, 'changed_hosts': 0,
+            'unreachable_hosts': 0, 'failed_hosts': 0, 'skipped_hosts': 0,
+            'final_status': 'FAILED', 'recap_summary': 'No execution logs'
+        }
+
+    recap_started = False
+    recap_lines = []
+    
+    for line in output_text.splitlines():
+        if 'PLAY RECAP' in line:
+            recap_started = True
+            continue
+        if recap_started:
+            if line.strip().startswith('PLAY [') or line.strip().startswith('TASK ['):
+                recap_started = False
+                continue
+            if line.strip():
+                recap_lines.append(line.strip())
+
+    hosts_stat = {}
+    recap_regex = re.compile(
+        r'^(?P<host>[^\s:]+)\s*:\s*ok=(?P<ok>\d+)\s+changed=(?P<changed>\d+)\s+unreachable=(?P<unreachable>\d+)\s+failed=(?P<failed>\d+)(?:\s+skipped=(?P<skipped>\d+))?'
+    )
+
+    for line in recap_lines:
+        match = recap_regex.search(line)
+        if match:
+            h = match.group('host').strip()
+            ok_cnt = int(match.group('ok'))
+            chg_cnt = int(match.group('changed'))
+            unreach_cnt = int(match.group('unreachable'))
+            fail_cnt = int(match.group('failed'))
+            skip_cnt = int(match.group('skipped') or 0)
+            
+            hosts_stat[h] = {
+                'ok': ok_cnt,
+                'changed': chg_cnt,
+                'unreachable': unreach_cnt,
+                'failed': fail_cnt,
+                'skipped': skip_cnt
+            }
+
+    if not hosts_stat:
+        if "UNREACHABLE!" in output_text or "FAILED!" in output_text or "fatal:" in output_text:
+            return {
+                'total_hosts': 0, 'ok_hosts': 0, 'changed_hosts': 0,
+                'unreachable_hosts': 1, 'failed_hosts': 1, 'skipped_hosts': 0,
+                'final_status': 'FAILED', 'recap_summary': 'Ansible execution failed before PLAY RECAP'
+            }
+
+    total_hosts = len(hosts_stat)
+    ok_hosts = sum(1 for h, s in hosts_stat.items() if s['ok'] > 0 and s['unreachable'] == 0 and s['failed'] == 0)
+    changed_hosts = sum(1 for h, s in hosts_stat.items() if s['changed'] > 0)
+    unreachable_hosts = sum(1 for h, s in hosts_stat.items() if s['unreachable'] > 0)
+    failed_hosts = sum(1 for h, s in hosts_stat.items() if s['failed'] > 0)
+    skipped_hosts = sum(1 for h, s in hosts_stat.items() if s['skipped'] > 0)
+
+    if total_hosts > 0 and unreachable_hosts == 0 and failed_hosts == 0:
+        final_status = 'SUCCESS'
+    elif ok_hosts > 0 and (unreachable_hosts > 0 or failed_hosts > 0):
+        final_status = 'PARTIAL_SUCCESS'
+    else:
+        final_status = 'FAILED'
+
+    summary_parts = []
+    if unreachable_hosts > 0:
+        unreach_hosts_names = [h for h, s in hosts_stat.items() if s['unreachable'] > 0]
+        summary_parts.append(f"{unreachable_hosts} host(s) UNREACHABLE ({', '.join(unreach_hosts_names)})")
+    if failed_hosts > 0:
+        fail_hosts_names = [h for h, s in hosts_stat.items() if s['failed'] > 0]
+        summary_parts.append(f"{failed_hosts} host(s) FAILED ({', '.join(fail_hosts_names)})")
+    if ok_hosts > 0:
+        summary_parts.append(f"{ok_hosts} host(s) SUCCESS")
+
+    recap_summary = ", ".join(summary_parts) if summary_parts else ("All hosts completed successfully" if final_status == 'SUCCESS' else "Execution failed")
+
+    return {
+        'total_hosts': total_hosts,
+        'ok_hosts': ok_hosts,
+        'changed_hosts': changed_hosts,
+        'unreachable_hosts': unreachable_hosts,
+        'failed_hosts': failed_hosts,
+        'skipped_hosts': skipped_hosts,
+        'final_status': final_status,
+        'recap_summary': recap_summary
+    }
+
 def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operator_name):
     start_t = time.time()
     JOB_STATUS[job_id] = "RUNNING"
     JOB_LOGS[job_id] = f"[{datetime.now().strftime('%H:%M:%S')}] Initiating background synchronization for {target_hosts_pattern}...\n"
+    
+    pre_snapshot_users = {}
+    try:
+        conn_pre = get_db_connection()
+        cursor_pre = conn_pre.cursor()
+        cursor_pre.execute("SELECT host, user, fingerprint, comment FROM ssh_key_cache")
+        for r in cursor_pre.fetchall():
+            key_id = (r['host'], r['user'])
+            if key_id not in pre_snapshot_users:
+                pre_snapshot_users[key_id] = set()
+            pre_snapshot_users[key_id].add((r['fingerprint'], r['comment'] or ''))
+        conn_pre.close()
+    except Exception as pre_err:
+        print(f"Notice pre-sync snapshot: {pre_err}")
+
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=BASE_DIR, env=get_env(), timeout=180)
         output = res.stdout
@@ -1439,7 +2224,7 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
                 c = int(p_data.get('keys_count', 0)) if p_data.get('keys_count', '').isdigit() else 0
                 status = p_data.get('status', 'active' if c > 0 else 'none').strip()
                 keys_b64 = p_data.get('keys_b64', '').strip()
-                keys_text = base64.b64decode(keys_b64).decode('utf-8', errors='ignore').strip() if keys_b64 else ""
+                keys_text = safe_b64decode(keys_b64)
 
                 if h and u:
                     users_scanned.add(u)
@@ -1491,24 +2276,79 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
         with open(log_file, "w") as f:
             f.write(output)
 
-        JOB_STATUS[job_id] = "SUCCESS"
+        recap_info = parse_ansible_play_recap(output)
+        final_status = recap_info['final_status']
+        recap_summary = recap_info['recap_summary']
+
+        JOB_STATUS[job_id] = final_status
 
         cursor.execute('''
             UPDATE sync_history SET
-                status = 'SUCCESS',
+                status = %s,
                 ended_at = NOW(),
-                servers_processed = (SELECT COUNT(DISTINCT host) FROM ssh_key_cache),
+                servers_processed = %s,
                 users_scanned = %s,
                 keys_added = %s,
+                failures = %s,
                 execution_time_sec = %s
             WHERE job_id = %s
-        ''', (len(users_scanned), keys_added, exec_time, job_id))
+        ''', (final_status, recap_info['total_hosts'], len(users_scanned), keys_added, recap_summary if final_status != 'SUCCESS' else '', exec_time, job_id))
         
         cursor.execute('''
             INSERT INTO job_history (id, status, action, target_user, target_hosts, logs, operator_name, key_comment)
-            VALUES (%s, 'SUCCESS', 'SYNC_KEY_CACHE', 'all', %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE status='SUCCESS'
-        ''', (job_id, target_hosts_pattern, output, operator_name, f"Synced {keys_added} keys across {len(users_scanned)} users"))
+            VALUES (%s, %s, 'SYNC_KEY_CACHE', 'all', %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE status=VALUES(status)
+        ''', (job_id, final_status, target_hosts_pattern, output, operator_name, f"Sync {final_status}: {recap_summary}"))
+
+        # Post-Sync Change Tracking Diff Engine
+        try:
+            post_snapshot_users = {}
+            cursor.execute("SELECT host, user, fingerprint, comment FROM ssh_key_cache")
+            for r in cursor.fetchall():
+                key_id = (r['host'], r['user'])
+                if key_id not in post_snapshot_users:
+                    post_snapshot_users[key_id] = set()
+                post_snapshot_users[key_id].add((r['fingerprint'], r['comment'] or ''))
+
+            # Detect New Users
+            for (h, u) in post_snapshot_users.keys():
+                if (h, u) not in pre_snapshot_users:
+                    cursor.execute('''
+                        INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
+                        VALUES (%s, %s, %s, %s, 'NEW_USER', 'None', %s, %s)
+                    ''', (job_id, operator_name, h, u, f"User {u}", f"Discovered new Linux user account '{u}' on server '{h}'"))
+
+            # Detect Removed Users
+            for (h, u) in pre_snapshot_users.keys():
+                if (h, u) not in post_snapshot_users:
+                    cursor.execute('''
+                        INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
+                        VALUES (%s, %s, %s, %s, 'USER_REMOVED', %s, 'None', %s)
+                    ''', (job_id, operator_name, h, u, f"User {u}", f"User account '{u}' removed from server '{h}'"))
+
+            # Detect Key Additions
+            for (h, u), post_keys in post_snapshot_users.items():
+                pre_keys = pre_snapshot_users.get((h, u), set())
+                added_keys = post_keys - pre_keys
+                for fp, cmt in added_keys:
+                    cursor.execute('''
+                        INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
+                        VALUES (%s, %s, %s, %s, 'KEY_ADDED', 'None', %s, %s)
+                    ''', (job_id, operator_name, h, u, f"Key ({cmt or fp})", f"Authorized new SSH key ('{cmt or fp}') for user '{u}' on '{h}'"))
+
+            # Detect Unreachable Hosts
+            if 'UNREACHABLE' in recap_summary:
+                for line in output.splitlines():
+                    if 'UNREACHABLE!' in line:
+                        parts = line.split(']')
+                        unreach_h = parts[0].split('[')[-1].strip() if len(parts) >= 2 else 'Unknown'
+                        cursor.execute('''
+                            INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
+                            VALUES (%s, %s, %s, 'system', 'SERVER_UNREACHABLE', 'ONLINE', 'UNREACHABLE', %s)
+                        ''', (job_id, operator_name, unreach_h, f"Server '{unreach_h}' unreachable during SSH connection check"))
+
+        except Exception as diff_err:
+            print(f"Notice generating sync change diffs: {diff_err}")
 
         conn.close()
 
@@ -1569,12 +2409,7 @@ def audit_keys():
                     c = 0
                 status = p_data.get('status', 'active' if c > 0 else 'none').strip()
                 keys_b64 = p_data.get('keys_b64', '').strip()
-                keys_text = ""
-                if keys_b64:
-                    try:
-                        keys_text = base64.b64decode(keys_b64).decode('utf-8', errors='ignore').strip()
-                    except Exception:
-                        keys_text = ""
+                keys_text = safe_b64decode(keys_b64)
 
                 if h and u:
                     host_map[h] = {"host": h, "user": u, "keys_count": c, "status": status, "keys_text": keys_text}
@@ -1630,12 +2465,7 @@ def inspect_user_keys():
                         c = 0
                     status = p_data.get('status', 'active' if c > 0 else 'none').strip()
                     keys_b64 = p_data.get('keys_b64', '').strip()
-                    keys_text = ""
-                    if keys_b64:
-                        try:
-                            keys_text = base64.b64decode(keys_b64).decode('utf-8', errors='ignore').strip()
-                        except Exception:
-                            keys_text = ""
+                    keys_text = safe_b64decode(keys_b64)
 
                     parsed_keys = parse_authorized_keys_text(keys_text)
                     final_count = len(parsed_keys) if parsed_keys else c
@@ -1680,7 +2510,61 @@ def inspect_user_keys():
             "keys_text": kt
         })
 
-    return jsonify({"user": user, "inspect_results": results, "source": "cache"})
+    curr_u = get_current_user()
+    user_perms = curr_u.get('permissions', []) if curr_u else []
+    can_view_full = 'view:full_key' in user_perms
+
+    if not can_view_full:
+        for r in results:
+            if 'keys_list' in r:
+                for k in r['keys_list']:
+                    if 'raw_key' in k:
+                        k['raw_key'] = mask_ssh_key(k['raw_key'])
+            if 'keys_text' in r and r['keys_text']:
+                r['keys_text'] = "\n".join([mask_ssh_key(line) for line in r['keys_text'].splitlines() if line.strip()])
+
+    return jsonify({"user": user, "inspect_results": results, "source": "cache" if not live else "live", "can_copy_full": can_view_full})
+
+@app.route('/api/sync/changes', methods=['GET'])
+@require_perm('read:keys')
+def get_sync_change_logs():
+    job_id = request.args.get('job_id', '').strip()
+    change_type = request.args.get('change_type', '').strip()
+    host = request.args.get('host', '').strip()
+    user = request.args.get('user', '').strip()
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = []
+    params = []
+
+    if job_id:
+        where_clauses.append("job_id = %s")
+        params.append(job_id)
+
+    if change_type and change_type.lower() != 'all':
+        where_clauses.append("change_type = %s")
+        params.append(change_type)
+
+    if host and host.lower() != 'all':
+        where_clauses.append("host = %s")
+        params.append(host)
+
+    if user and user.lower() != 'all':
+        where_clauses.append("user = %s")
+        params.append(user)
+
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    cursor.execute(f"SELECT id, job_id, timestamp, operator_name, host, user, change_type, previous_value, new_value, description FROM sync_change_log{where_sql} ORDER BY id DESC LIMIT 250", params)
+    rows = cursor.fetchall()
+    conn.close()
+
+    for r in rows:
+        r['timestamp'] = format_dt(r.get('timestamp'))
+
+    return jsonify(rows)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5050))

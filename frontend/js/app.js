@@ -769,37 +769,206 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     /* ============================================================
-       INVENTORY TABLE
+       INVENTORY TABLE & MANAGED SERVERS
     ============================================================ */
+    /* ============================================================
+       ENTERPRISE SERVER EXPLORER STATE & LOGIC
+    ============================================================ */
+    const explorerSearchInput   = document.getElementById('explorer-search-input');
+    const explorerFilterEnv     = document.getElementById('explorer-filter-env');
+    const explorerFilterRegion  = document.getElementById('explorer-filter-region');
+    const explorerFilterStatus  = document.getElementById('explorer-filter-status');
+    const btnToggleFavorites    = document.getElementById('btn-toggle-favorites');
+    const btnResetExplorerFilters= document.getElementById('btn-reset-explorer-filters');
+    const btnExplorerBatchPing  = document.getElementById('btn-explorer-batch-ping');
+    const btnExplorerBulkSync   = document.getElementById('btn-explorer-bulk-sync');
+    const chkExplorerSelectAll  = document.getElementById('chk-explorer-select-all');
+    const explorerOnlineCount   = document.getElementById('explorer-online-count');
+
+    let explorerFavoritesOnly   = false;
+    let explorerDebounceTimer   = null;
+
     function renderInventoryTable() {
-        inventoryTableBody.innerHTML = '';
-        const hosts = inventoryData.all_hosts || [];
-        inventoryCount.textContent = `${hosts.length} Server${hosts.length !== 1 ? 's' : ''}`;
-        statServers.textContent = hosts.length;
+        loadServerExplorer();
+    }
 
-        hosts.forEach(host => {
-            const tr          = document.createElement('tr');
-            const activeUsers = serverUsersSummary[host.name] || [];
-            const userBadges  = activeUsers.length > 0
-                ? activeUsers.map(u => `
-                    <span class="badge badge-success" style="cursor:pointer;margin:2px;" onclick="quickTargetUserHost('${u}','${host.name}')">
-                        <i class="fa-solid fa-user"></i> ${u}
-                    </span>`).join('')
-                : '<span class="badge badge-status">None — click Live Scan</span>';
+    function loadServerExplorer() {
+        if (!inventoryTableBody) return;
 
-            tr.innerHTML = `
-                <td><strong>${host.name}</strong></td>
-                <td><code>${host.ip}</code></td>
-                <td><span class="badge badge-info">${host.group}</span></td>
-                <td style="max-width:280px;white-space:normal;">${userBadges}</td>
-                <td><span class="badge badge-success"><i class="fa-solid fa-check"></i> Managed</span></td>
-                <td>
-                    <button class="btn btn-outline btn-sm" onclick="quickDeployToHost('${host.name}')">
-                        <i class="fa-solid fa-key"></i> Target
-                    </button>
-                </td>
-            `;
-            inventoryTableBody.appendChild(tr);
+        const q = explorerSearchInput ? explorerSearchInput.value.trim() : '';
+        const env = explorerFilterEnv ? explorerFilterEnv.value : 'all';
+        const region = explorerFilterRegion ? explorerFilterRegion.value : 'all';
+        const status = explorerFilterStatus ? explorerFilterStatus.value : 'all';
+
+        let url = `/api/servers/explorer?q=${encodeURIComponent(q)}&env=${encodeURIComponent(env)}&region=${encodeURIComponent(region)}&status=${encodeURIComponent(status)}&favorites=${explorerFavoritesOnly}`;
+
+        fetch(url)
+            .then(r => r.json())
+            .then(data => {
+                const servers = data.servers || [];
+                if (inventoryCount) inventoryCount.textContent = `${data.total_servers || servers.length} Server${servers.length !== 1 ? 's' : ''}`;
+                if (explorerOnlineCount) explorerOnlineCount.textContent = `${data.online_servers || 0} Online`;
+                if (statServers) statServers.textContent = data.total_servers || servers.length;
+
+                renderServerExplorerRows(servers);
+            })
+            .catch(err => {
+                inventoryTableBody.innerHTML = `<tr><td colspan="8"><div class="error-msg">Error loading Server Explorer: ${err.message}</div></td></tr>`;
+            });
+    }
+
+    function renderServerExplorerRows(servers) {
+        if (servers.length === 0) {
+            inventoryTableBody.innerHTML = `
+                <tr>
+                    <td colspan="8" class="text-center" style="padding:24px;color:var(--text-muted);">
+                        <i class="fa-solid fa-server" style="font-size:2rem;margin-bottom:8px;display:block;opacity:0.4;"></i>
+                        No managed servers found matching filter criteria.
+                    </td>
+                </tr>`;
+            return;
+        }
+
+        const canManage = currentUser && currentUser.permissions && currentUser.permissions.includes('manage:servers');
+
+        let html = '';
+        servers.forEach(s => {
+            const isFav = s.is_favorite;
+            const isOnline = s.status === 'online';
+            const envBadgeClass = s.environment === 'Production' ? 'badge-danger' : (s.environment === 'Staging' ? 'badge-warning' : 'badge-info');
+
+            html += `
+                <tr>
+                    <td><input type="checkbox" class="chk-server-select" value="${escapeHtml(s.host)}"></td>
+                    <td>
+                        <div style="display:flex;align-items:center;gap:8px;">
+                            <button class="btn-fav-star" onclick="toggleFavoriteServer('${escapeHtml(s.host)}', ${isFav ? 0 : 1})" style="background:none;border:none;cursor:pointer;font-size:14px;">
+                                <i class="fa-solid fa-star" style="color:${isFav ? '#eab308' : 'rgba(255,255,255,0.2)'};"></i>
+                            </button>
+                            <strong>${escapeHtml(s.host)}</strong>
+                        </div>
+                    </td>
+                    <td><code>${escapeHtml(s.ip || '172.0.16.84')}</code></td>
+                    <td>
+                        <span class="badge ${envBadgeClass}" style="font-size:10px;">${escapeHtml(s.environment || 'Production')}</span>
+                        <span class="badge badge-status" style="font-size:10px;">${escapeHtml(s.region || 'us-east-1')}</span>
+                    </td>
+                    <td>
+                        <span class="badge badge-primary" style="font-size:10px;">${escapeHtml(s.group_name || 'web_servers')}</span>
+                        <div style="font-size:10.5px;color:var(--text-dim);margin-top:2px;">${escapeHtml(s.owner || 'DevOps')}</div>
+                    </td>
+                    <td>
+                        <span class="badge ${isOnline ? 'badge-success' : 'badge-danger'}">
+                            <span class="badge-dot"></span> ${isOnline ? 'ONLINE' : 'OFFLINE'}
+                        </span>
+                        <div style="font-size:10px;color:var(--text-dim);margin-top:2px;">Ping: ${escapeHtml(s.last_ping_at || 'Recently')}</div>
+                    </td>
+                    <td>
+                        <span class="badge badge-success" style="cursor:pointer;" onclick="openKeyInspectorModal('${escapeHtml(s.host)}', 'root')">
+                            <i class="fa-solid fa-user"></i> root
+                        </span>
+                    </td>
+                    <td>
+                        <div style="display:flex;gap:6px;">
+                            <button class="btn btn-outline btn-xs" onclick="quickDeployToHost('${escapeHtml(s.host)}')">
+                                <i class="fa-solid fa-key"></i> Target
+                            </button>
+                            ${canManage ? `
+                                <button class="btn btn-outline btn-xs" style="color:var(--danger);border-color:rgba(239,68,68,0.3);" onclick="removeManagedServer('${escapeHtml(s.host)}')">
+                                    <i class="fa-solid fa-trash"></i>
+                                </button>
+                            ` : ''}
+                        </div>
+                    </td>
+                </tr>`;
+        });
+
+        inventoryTableBody.innerHTML = html;
+    }
+
+    window.toggleFavoriteServer = function(host, isFav) {
+        fetch('/api/servers/metadata', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host: host, is_favorite: isFav })
+        })
+        .then(() => loadServerExplorer());
+    };
+
+    if (explorerSearchInput) {
+        explorerSearchInput.addEventListener('input', () => {
+            clearTimeout(explorerDebounceTimer);
+            explorerDebounceTimer = setTimeout(loadServerExplorer, 150);
+        });
+    }
+
+    if (explorerFilterEnv) explorerFilterEnv.addEventListener('change', loadServerExplorer);
+    if (explorerFilterRegion) explorerFilterRegion.addEventListener('change', loadServerExplorer);
+    if (explorerFilterStatus) explorerFilterStatus.addEventListener('change', loadServerExplorer);
+
+    if (btnToggleFavorites) {
+        btnToggleFavorites.addEventListener('click', () => {
+            explorerFavoritesOnly = !explorerFavoritesOnly;
+            btnToggleFavorites.style.background = explorerFavoritesOnly ? 'rgba(234,179,8,0.2)' : '';
+            btnToggleFavorites.style.borderColor = explorerFavoritesOnly ? '#eab308' : '';
+            loadServerExplorer();
+        });
+    }
+
+    if (btnResetExplorerFilters) {
+        btnResetExplorerFilters.addEventListener('click', () => {
+            if (explorerSearchInput) explorerSearchInput.value = '';
+            if (explorerFilterEnv) explorerFilterEnv.value = 'all';
+            if (explorerFilterRegion) explorerFilterRegion.value = 'all';
+            if (explorerFilterStatus) explorerFilterStatus.value = 'all';
+            explorerFavoritesOnly = false;
+            if (btnToggleFavorites) {
+                btnToggleFavorites.style.background = '';
+                btnToggleFavorites.style.borderColor = '';
+            }
+            loadServerExplorer();
+        });
+    }
+
+    if (chkExplorerSelectAll) {
+        chkExplorerSelectAll.addEventListener('change', () => {
+            const checkboxes = document.querySelectorAll('.chk-server-select');
+            checkboxes.forEach(c => c.checked = chkExplorerSelectAll.checked);
+        });
+    }
+
+    if (btnExplorerBatchPing) {
+        btnExplorerBatchPing.addEventListener('click', () => {
+            const selected = Array.from(document.querySelectorAll('.chk-server-select:checked')).map(c => c.value);
+            btnExplorerBatchPing.disabled = true;
+            btnExplorerBatchPing.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Pinging...';
+
+            fetch('/api/servers/ping_batch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ hosts: selected })
+            })
+            .then(r => r.json())
+            .then(data => {
+                btnExplorerBatchPing.disabled = false;
+                btnExplorerBatchPing.innerHTML = '<i class="fa-solid fa-network-wired"></i> Batch Ping';
+                loadServerExplorer();
+            })
+            .catch(() => {
+                btnExplorerBatchPing.disabled = false;
+                btnExplorerBatchPing.innerHTML = '<i class="fa-solid fa-network-wired"></i> Batch Ping';
+            });
+        });
+    }
+
+    if (btnExplorerBulkSync) {
+        btnExplorerBulkSync.addEventListener('click', () => {
+            const selected = Array.from(document.querySelectorAll('.chk-server-select:checked')).map(c => c.value);
+            if (selected.length === 0) {
+                alert('Please select at least one server from the list to run Bulk Sync.');
+                return;
+            }
+            triggerSyncJob('bulk', selected);
         });
     }
 
@@ -812,6 +981,123 @@ document.addEventListener('DOMContentLoaded', () => {
     window.quickDeployToHost = function(host) {
         document.querySelector('[data-tab="tab-deploy"]').click();
         setServerCheckboxes(host);
+    };
+
+    // Modal Add Managed Server Handlers
+    const btnOpenAddServerModal  = document.getElementById('btn-open-add-server-modal');
+    const btnCloseAddServerModal = document.getElementById('btn-close-add-server-modal');
+    const btnCancelAddServer     = document.getElementById('btn-cancel-add-server');
+    const btnSubmitAddServer     = document.getElementById('btn-submit-add-server');
+    const modalAddServer         = document.getElementById('modal-add-server');
+
+    const tabBtnSingleServer     = document.getElementById('tab-btn-single-server');
+    const tabBtnBulkServer       = document.getElementById('tab-btn-bulk-server');
+    const formSingleServer       = document.getElementById('form-single-server');
+    const formBulkServer         = document.getElementById('form-bulk-server');
+    const addServerStatusMsg     = document.getElementById('add-server-status-msg');
+
+    let currentAddServerMode     = 'single';
+
+    if (btnOpenAddServerModal) {
+        btnOpenAddServerModal.addEventListener('click', () => {
+            if (modalAddServer) modalAddServer.style.display = 'flex';
+            if (addServerStatusMsg) addServerStatusMsg.innerHTML = '';
+        });
+    }
+
+    const closeAddServerModal = () => {
+        if (modalAddServer) modalAddServer.style.display = 'none';
+    };
+
+    if (btnCloseAddServerModal) btnCloseAddServerModal.addEventListener('click', closeAddServerModal);
+    if (btnCancelAddServer) btnCancelAddServer.addEventListener('click', closeAddServerModal);
+
+    if (tabBtnSingleServer && tabBtnBulkServer) {
+        tabBtnSingleServer.addEventListener('click', () => {
+            currentAddServerMode = 'single';
+            tabBtnSingleServer.className = 'btn btn-sm btn-primary';
+            tabBtnBulkServer.className = 'btn btn-sm btn-outline';
+            if (formSingleServer) formSingleServer.style.display = 'block';
+            if (formBulkServer) formBulkServer.style.display = 'none';
+        });
+        tabBtnBulkServer.addEventListener('click', () => {
+            currentAddServerMode = 'bulk';
+            tabBtnBulkServer.className = 'btn btn-sm btn-primary';
+            tabBtnSingleServer.className = 'btn btn-sm btn-outline';
+            if (formSingleServer) formSingleServer.style.display = 'none';
+            if (formBulkServer) formBulkServer.style.display = 'block';
+        });
+    }
+
+    if (btnSubmitAddServer) {
+        btnSubmitAddServer.addEventListener('click', () => {
+            let payload = {};
+            if (currentAddServerMode === 'single') {
+                const sName = document.getElementById('add-server-name').value.trim();
+                const sIp   = document.getElementById('add-server-ip').value.trim();
+                const sGrp  = document.getElementById('add-server-group').value.trim() || 'web_servers';
+
+                if (!sName || !sIp) {
+                    if (addServerStatusMsg) addServerStatusMsg.innerHTML = '<span style="color:var(--danger);font-size:12px;">Please fill in both Server Host Alias and IP Address.</span>';
+                    return;
+                }
+                payload = { servers: [{ name: sName, ip: sIp, group: sGrp }] };
+            } else {
+                const bulkGrp  = document.getElementById('add-bulk-group').value.trim() || 'web_servers';
+                const bulkText = document.getElementById('add-bulk-text').value.trim();
+                if (!bulkText) {
+                    if (addServerStatusMsg) addServerStatusMsg.innerHTML = '<span style="color:var(--danger);font-size:12px;">Please paste at least one server line.</span>';
+                    return;
+                }
+                payload = { group: bulkGrp, bulk_text: bulkText };
+            }
+
+            btnSubmitAddServer.disabled = true;
+            btnSubmitAddServer.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+
+            fetch('/api/servers/add', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(data => {
+                btnSubmitAddServer.disabled = false;
+                btnSubmitAddServer.innerHTML = '<i class="fa-solid fa-plus-circle"></i> Save Server(s)';
+                if (data.error) {
+                    if (addServerStatusMsg) addServerStatusMsg.innerHTML = `<span style="color:var(--danger);font-size:12px;">${escapeHtml(data.error)}</span>`;
+                } else {
+                    if (addServerStatusMsg) addServerStatusMsg.innerHTML = `<span style="color:var(--success);font-size:12px;">${escapeHtml(data.message)}</span>`;
+                    setTimeout(() => {
+                        closeAddServerModal();
+                        fetchInventory();
+                    }, 1200);
+                }
+            })
+            .catch(err => {
+                btnSubmitAddServer.disabled = false;
+                btnSubmitAddServer.innerHTML = '<i class="fa-solid fa-plus-circle"></i> Save Server(s)';
+                if (addServerStatusMsg) addServerStatusMsg.innerHTML = `<span style="color:var(--danger);font-size:12px;">Failed to add server: ${err.message}</span>`;
+            });
+        });
+    }
+
+    window.removeManagedServer = function(hostName) {
+        if (!confirm(`Are you sure you want to remove server '${hostName}' from Managed Inventory?`)) return;
+        fetch('/api/servers/remove', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ host: hostName })
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.status === 'success') {
+                fetchInventory();
+            } else {
+                alert(data.error || 'Failed to remove server');
+            }
+        })
+        .catch(err => alert('Error removing server: ' + err.message));
     };
 
     /* ============================================================
@@ -1411,23 +1697,45 @@ document.addEventListener('DOMContentLoaded', () => {
 
         let html = '';
         allKeys.forEach((k, idx) => {
+            const rawKeyText = k.raw_key || '';
+            const isMasked = rawKeyText.includes('[MASKED]');
+
             html += `
                 <tr>
                     <td><strong>#${idx + 1}</strong></td>
                     <td><code>${escapeHtml(k.user)}</code></td>
                     <td><span class="badge badge-primary" style="font-size:10px;"><i class="fa-solid fa-server"></i> ${escapeHtml(k.host)}</span></td>
                     <td><span class="comment-chip"><i class="fa-solid fa-laptop-code"></i> ${escapeHtml(k.comment)}</span></td>
-                    <td>
-                        <div style="font-size:11px;font-weight:600;color:var(--text-main);">${escapeHtml(k.algorithm)}</div>
-                        <code style="font-size:10.5px;color:var(--text-muted);">${escapeHtml(k.fingerprint)}</code>
+                    <td style="max-width:440px;">
+                        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;">
+                            <div>
+                                <span class="badge badge-info" style="font-size:10px;">${escapeHtml(k.algorithm)}</span>
+                                <code style="font-size:10px;color:var(--text-muted);">${escapeHtml(k.fingerprint)}</code>
+                            </div>
+                        </div>
+                        <div style="background:rgba(15,23,42,0.85);border:1px solid rgba(255,255,255,0.1);padding:8px 10px;border-radius:6px;position:relative;margin-top:4px;">
+                            <div style="font-size:10px;text-transform:uppercase;color:var(--text-dim);font-weight:700;margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;">
+                                <span><i class="fa-solid fa-key" style="color:var(--primary);"></i> Complete SSH Public Key String</span>
+                            </div>
+                            <div style="font-family:var(--font-mono);font-size:11px;color:var(--primary);word-break:break-all;padding-right:90px;line-height:1.4;max-height:100px;overflow-y:auto;user-select:all;">
+                                ${escapeHtml(rawKeyText)}
+                            </div>
+                            ${!isMasked ? `
+                                <button class="btn btn-primary btn-xs" onclick="copyTextToClipboard(\`${escapeJS(rawKeyText)}\`, this)" style="position:absolute;top:8px;right:8px;font-size:10.5px;padding:4px 8px;" title="Copy complete SSH public key to clipboard">
+                                    <i class="fa-solid fa-copy"></i> Copy Key
+                                </button>
+                            ` : ''}
+                        </div>
                     </td>
-                    <td style="text-align:right;white-space:nowrap;">
-                        <button class="btn btn-primary btn-xs" style="margin-right:6px;" onclick="openCrossServerCopyModal('${k.user}', '${k.host}', \`${escapeJS(k.raw_key)}\`, \`${escapeJS(k.comment)}\`, \`${escapeJS(k.fingerprint)}\`)" title="Copy this key to another user or server account">
-                            <i class="fa-solid fa-copy"></i> Copy to User
-                        </button>
-                        <button class="btn btn-danger btn-xs" onclick="removeSingleKey('${k.user}', '${k.host}', \`${escapeJS(k.raw_key)}\`, \`${escapeJS(k.comment)}\`)" title="Remove ONLY this specific key line">
-                            <i class="fa-solid fa-trash"></i> Remove Key
-                        </button>
+                    <td style="text-align:right;white-space:nowrap;vertical-align:top;">
+                        <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end;">
+                            <button class="btn btn-outline btn-xs" onclick="openCrossServerCopyModal('${k.user}', '${k.host}', \`${escapeJS(k.raw_key)}\`, \`${escapeJS(k.comment)}\`, \`${escapeJS(k.fingerprint)}\`)" title="Copy this key to another user or server account">
+                                <i class="fa-solid fa-share font-xs"></i> Copy to User
+                            </button>
+                            <button class="btn btn-danger btn-xs" onclick="removeSingleKey('${k.user}', '${k.host}', \`${escapeJS(k.raw_key)}\`, \`${escapeJS(k.comment)}\`)" title="Remove ONLY this specific key line">
+                                <i class="fa-solid fa-trash"></i> Remove Key
+                            </button>
+                        </div>
                     </td>
                 </tr>`;
         });
@@ -1585,6 +1893,55 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnCloseCrossCopy       = document.getElementById('btn-close-cross-copy');
     const btnCancelCrossCopy      = document.getElementById('btn-cancel-cross-copy');
 
+    function loadDestinationUsersForHost(destHost, selectElem) {
+        if (!selectElem) return;
+        selectElem.innerHTML = '<option value="">Loading users for ' + (destHost || 'server') + '...</option>';
+
+        fetch('/api/servers/users?host=' + encodeURIComponent(destHost || 'all'))
+            .then(r => r.json())
+            .then(data => {
+                selectElem.innerHTML = '';
+                const users = data.users || [];
+
+                const optDefault = document.createElement('option');
+                optDefault.value = '';
+                optDefault.textContent = `-- Select Target User on ${data.host} (${users.length} available) --`;
+                selectElem.appendChild(optDefault);
+
+                users.forEach(u => {
+                    const opt = document.createElement('option');
+                    opt.value = u;
+                    opt.textContent = `${u} (${data.host})`;
+                    selectElem.appendChild(opt);
+                });
+
+                if (users.length === 0) {
+                    const optEmpty = document.createElement('option');
+                    optEmpty.value = '';
+                    optEmpty.disabled = true;
+                    optEmpty.textContent = 'No cached users found — run a Sync to refresh';
+                    selectElem.appendChild(optEmpty);
+                }
+            })
+            .catch(() => {
+                selectElem.innerHTML = '<option value="">Error loading users</option>';
+            });
+    }
+
+    if (crossCopyDestHost) {
+        crossCopyDestHost.addEventListener('change', () => {
+            loadDestinationUsersForHost(crossCopyDestHost.value, crossCopyDestUserSelect);
+        });
+    }
+
+    const sharingDestHostElem = document.getElementById('sharing-dest-host');
+    const sharingDestUserElem = document.getElementById('sharing-dest-user-select');
+    if (sharingDestHostElem && sharingDestUserElem) {
+        sharingDestHostElem.addEventListener('change', () => {
+            loadDestinationUsersForHost(sharingDestHostElem.value, sharingDestUserElem);
+        });
+    }
+
     let activeCrossCopyKey = null;
 
     window.openCrossServerCopyModal = function(sourceUser, sourceHost, rawKey, comment, fingerprint) {
@@ -1618,28 +1975,20 @@ document.addEventListener('DOMContentLoaded', () => {
                 opt.textContent = `${h.name} (${h.ip})`;
                 crossCopyDestHost.appendChild(opt);
             });
+
+            // Auto-select first target host if not all
+            if (hosts.length > 0) {
+                const targetInitial = (sourceHost && sourceHost !== 'all' && hosts.some(h => h.name !== sourceHost)) 
+                    ? hosts.find(h => h.name !== sourceHost).name 
+                    : hosts[0].name;
+                crossCopyDestHost.value = targetInitial;
+            }
         }
 
-        // Populate destination user select with known users
-        if (crossCopyDestUserSelect) {
-            crossCopyDestUserSelect.innerHTML = '';
-            const uDir = (fullMatrixData && fullMatrixData.user_directory) || {};
-            const knownUsers = Object.keys(uDir).sort();
-
-            const optDefault = document.createElement('option');
-            optDefault.value = '';
-            optDefault.textContent = '-- Select Destination User Account --';
-            crossCopyDestUserSelect.appendChild(optDefault);
-
-            knownUsers.forEach(u => {
-                const opt = document.createElement('option');
-                opt.value = u;
-                opt.textContent = u;
-                crossCopyDestUserSelect.appendChild(opt);
-            });
-
-            if (crossCopyDestUserCustom) crossCopyDestUserCustom.value = '';
-        }
+        // Dynamically load server-specific destination users
+        const selectedHostVal = crossCopyDestHost ? crossCopyDestHost.value : 'all';
+        loadDestinationUsersForHost(selectedHostVal, crossCopyDestUserSelect);
+        if (crossCopyDestUserCustom) crossCopyDestUserCustom.value = '';
 
         modalCrossCopy.classList.add('active');
     };
@@ -2329,6 +2678,25 @@ document.addEventListener('DOMContentLoaded', () => {
             });
     }
 
+    window.copyTextToClipboard = function(text, btn) {
+        if (!text) return;
+        if (!navigator.clipboard) {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+        } else {
+            navigator.clipboard.writeText(text);
+        }
+        if (btn) {
+            const origHTML = btn.innerHTML;
+            btn.innerHTML = '<i class="fa-solid fa-check" style="color:var(--success);"></i> Copied!';
+            setTimeout(() => { btn.innerHTML = origHTML; }, 2000);
+        }
+    };
+
     function renderGlobalSearchRows(rows) {
         if (!globalTableBody) return;
         if (rows.length === 0) {
@@ -2340,6 +2708,13 @@ document.addEventListener('DOMContentLoaded', () => {
         rows.forEach((r, idx) => {
             const algoClass = (r.algorithm || '').toLowerCase().includes('ed25519') ? 'ed25519' : ((r.algorithm || '').toLowerCase().includes('ecdsa') ? 'ecdsa' : 'rsa');
             const isDup = r.is_duplicate;
+            const canCopyFull = r.can_copy_full;
+
+            const copyBtnHtml = canCopyFull
+                ? `<button class="btn btn-outline btn-xs" onclick="copyTextToClipboard(\`${escapeJS(r.raw_key)}\`, this)" title="Copy Full Unmasked SSH Key" style="margin-right:4px;">
+                    <i class="fa-solid fa-copy"></i> Copy Key
+                   </button>`
+                : '';
 
             html += `
                 <tr>
@@ -2349,10 +2724,16 @@ document.addEventListener('DOMContentLoaded', () => {
                     <td><span style="font-family:var(--font-mono);font-size:11px;color:var(--text-dim);">${escapeHtml(r.home_dir)}</span></td>
                     <td><span class="key-algo-badge ${algoClass}">${escapeHtml(r.algorithm)}</span></td>
                     <td><span class="comment-chip"><i class="fa-solid fa-laptop-code"></i> ${escapeHtml(r.comment)}</span></td>
-                    <td><code style="font-size:10.5px;color:var(--text-muted);">${escapeHtml(r.fingerprint)}</code></td>
+                    <td style="max-width:280px;">
+                        <code style="font-size:10.5px;color:var(--text-muted);display:block;margin-bottom:4px;">${escapeHtml(r.fingerprint)}</code>
+                        <div style="font-family:var(--font-mono);font-size:10px;color:var(--primary);background:rgba(0,0,0,0.3);padding:4px 6px;border-radius:4px;word-break:break-all;max-height:60px;overflow-y:auto;user-select:all;border:1px solid rgba(255,255,255,0.06);">
+                            ${escapeHtml(r.raw_key)}
+                        </div>
+                    </td>
                     <td>${isDup ? '<span class="badge badge-warning"><i class="fa-solid fa-copy"></i> Duplicate</span>' : '<span class="badge badge-success"><i class="fa-solid fa-check"></i> Active</span>'}</td>
                     <td><span style="font-size:10.5px;color:var(--text-dim);">${escapeHtml(r.last_synced_at || 'Just now')}</span></td>
-                    <td style="text-align:right;white-space:nowrap;">
+                    <td style="text-align:right;white-space:nowrap;display:flex;gap:4px;justify-content:flex-end;">
+                        ${copyBtnHtml}
                         <button class="btn btn-primary btn-xs" onclick="openKeyInspectorModal('${r.host}', '${r.user}')" title="Inspect user keys">
                             <i class="fa-solid fa-magnifying-glass"></i> Inspect
                         </button>
@@ -2409,6 +2790,52 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnSyncSingleHost    = document.getElementById('btn-sync-single-host');
     const btnSyncRefreshMetrics= document.getElementById('btn-sync-refresh-metrics');
 
+    const syncChangesTableBody = document.getElementById('sync-changes-table-body');
+    const changeFilterType     = document.getElementById('change-filter-type');
+    const btnRefreshChangeLogs = document.getElementById('btn-refresh-change-logs');
+
+    function loadSyncChangeLogs() {
+        if (!syncChangesTableBody) return;
+        const changeType = changeFilterType ? changeFilterType.value : 'all';
+
+        fetch('/api/sync/changes?change_type=' + encodeURIComponent(changeType))
+            .then(r => r.json())
+            .then(logs => {
+                if (logs.length === 0) {
+                    syncChangesTableBody.innerHTML = '<tr><td colspan="7" class="text-center" style="padding:16px;color:var(--text-muted);">No infrastructure changes recorded yet.</td></tr>';
+                    return;
+                }
+
+                let html = '';
+                logs.forEach(c => {
+                    let catBadge = '<span class="badge badge-info">INFO</span>';
+                    if (c.change_type === 'NEW_USER') catBadge = '<span class="badge badge-success"><i class="fa-solid fa-user-plus"></i> NEW USER</span>';
+                    else if (c.change_type === 'KEY_ADDED') catBadge = '<span class="badge badge-success"><i class="fa-solid fa-key"></i> KEY ADDED</span>';
+                    else if (c.change_type === 'KEY_REMOVED') catBadge = '<span class="badge badge-warning"><i class="fa-solid fa-key"></i> KEY REMOVED</span>';
+                    else if (c.change_type === 'USER_REMOVED') catBadge = '<span class="badge badge-danger"><i class="fa-solid fa-user-minus"></i> USER REMOVED</span>';
+                    else if (c.change_type === 'SERVER_UNREACHABLE') catBadge = '<span class="badge badge-danger"><i class="fa-solid fa-triangle-exclamation"></i> UNREACHABLE</span>';
+
+                    html += `
+                        <tr>
+                            <td><span style="font-size:11px;color:var(--text-dim);">${escapeHtml(c.timestamp)}</span></td>
+                            <td><code>${escapeHtml(c.job_id)}</code></td>
+                            <td>${escapeHtml(c.operator_name || 'Admin')}</td>
+                            <td><span class="badge badge-primary"><i class="fa-solid fa-server"></i> ${escapeHtml(c.host)}</span></td>
+                            <td><code>${escapeHtml(c.user)}</code></td>
+                            <td>${catBadge}</td>
+                            <td><span style="font-size:12px;color:var(--text-main);">${escapeHtml(c.description)}</span></td>
+                        </tr>`;
+                });
+                syncChangesTableBody.innerHTML = html;
+            })
+            .catch(() => {
+                syncChangesTableBody.innerHTML = '<tr><td colspan="7" class="text-center" style="padding:16px;color:var(--danger);">Error loading change audit logs.</td></tr>';
+            });
+    }
+
+    if (changeFilterType) changeFilterType.addEventListener('change', loadSyncChangeLogs);
+    if (btnRefreshChangeLogs) btnRefreshChangeLogs.addEventListener('click', loadSyncChangeLogs);
+
     function loadSyncDashboard() {
         fetch('/api/sync/status')
             .then(r => r.json())
@@ -2421,6 +2848,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 updateHeaderLastSynced(data.last_global_sync);
                 renderSyncHistoryTable(data.recent_history || []);
+                loadSyncChangeLogs();
             })
             .catch(() => {});
     }
@@ -2434,7 +2862,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
         let html = '';
         history.forEach(h => {
-            const isSuccess = (h.status === 'SUCCESS');
+            let statusBadge = '<span class="badge badge-success">SUCCESS</span>';
+            if (h.status === 'PARTIAL_SUCCESS') {
+                statusBadge = `<span class="badge badge-warning" title="${escapeHtml(h.failures || 'Some hosts failed')}">PARTIAL SUCCESS</span>`;
+            } else if (h.status === 'FAILED') {
+                statusBadge = `<span class="badge badge-danger" title="${escapeHtml(h.failures || 'Execution failed')}">FAILED</span>`;
+            }
+
+            const failDetail = h.failures ? `<div style="font-size:10px;color:var(--danger);margin-top:2px;">${escapeHtml(h.failures)}</div>` : '';
+
             html += `
                 <tr>
                     <td><code>${escapeHtml(h.job_id)}</code></td>
@@ -2445,7 +2881,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     <td>${h.users_scanned || 0} users</td>
                     <td><strong style="color:var(--success);">${h.keys_added || 0} keys</strong></td>
                     <td>${h.execution_time_sec ? h.execution_time_sec + 's' : '--'}</td>
-                    <td>${isSuccess ? '<span class="badge badge-success">SUCCESS</span>' : '<span class="badge badge-danger">FAILED</span>'}</td>
+                    <td>${statusBadge}${failDetail}</td>
                 </tr>`;
         });
         syncHistoryTableBody.innerHTML = html;
@@ -2487,11 +2923,19 @@ document.addEventListener('DOMContentLoaded', () => {
                             clearInterval(interval);
                             if (syncJobStatusBadge) {
                                 syncJobStatusBadge.className = 'badge badge-success';
-                                syncJobStatusBadge.textContent = 'COMPLETED';
+                                syncJobStatusBadge.textContent = 'SUCCESS';
                             }
                             loadSyncDashboard();
                             loadGlobalSearch();
                             loadAccessMatrix(false);
+                        } else if (job.status === 'PARTIAL_SUCCESS') {
+                            clearInterval(interval);
+                            if (syncJobStatusBadge) {
+                                syncJobStatusBadge.className = 'badge badge-warning';
+                                syncJobStatusBadge.textContent = 'PARTIAL SUCCESS';
+                            }
+                            loadSyncDashboard();
+                            loadGlobalSearch();
                         } else if (job.status === 'FAILED') {
                             clearInterval(interval);
                             if (syncJobStatusBadge) {
@@ -2533,6 +2977,151 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     /* ============================================================
+       AUTHENTICATION & RBAC STATE
+    ============================================================ */
+    const loginPortal        = document.getElementById('login-portal');
+    const formLogin          = document.getElementById('form-login');
+    const loginUsernameInput = document.getElementById('login-username');
+    const loginPasswordInput = document.getElementById('login-password');
+    const loginErrorMsg      = document.getElementById('login-error-msg');
+    const btnSubmitLogin     = document.getElementById('btn-submit-login');
+
+    const headerUserBadge    = document.getElementById('header-user-badge');
+    const userDisplayName    = document.getElementById('user-display-name');
+    const userRoleBadge      = document.getElementById('user-role-badge');
+    const btnHeaderLogout    = document.getElementById('btn-header-logout');
+
+    let currentUser          = null;
+
+    function checkAuthSession() {
+        fetch('/api/auth/me')
+            .then(r => r.json())
+            .then(data => {
+                if (data.authenticated && data.user) {
+                    currentUser = data.user;
+                    if (loginPortal) loginPortal.style.display = 'none';
+                    if (headerUserBadge) headerUserBadge.style.display = 'flex';
+                    if (userDisplayName) userDisplayName.textContent = currentUser.full_name || currentUser.username;
+                    if (userRoleBadge) {
+                        userRoleBadge.textContent = currentUser.role.toUpperCase();
+                        userRoleBadge.className = currentUser.role === 'admin' ? 'badge badge-primary' : 'badge badge-info';
+                    }
+                    applyRolePermissions(currentUser);
+                    initDashboard();
+                } else {
+                    currentUser = null;
+                    if (loginPortal) loginPortal.style.display = 'flex';
+                    if (headerUserBadge) headerUserBadge.style.display = 'none';
+                }
+            })
+            .catch(() => {
+                if (loginPortal) loginPortal.style.display = 'flex';
+            });
+    }
+
+    if (formLogin) {
+        formLogin.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const username = loginUsernameInput ? loginUsernameInput.value.trim() : '';
+            const password = loginPasswordInput ? loginPasswordInput.value.trim() : '';
+
+            if (!username || !password) {
+                if (loginErrorMsg) loginErrorMsg.textContent = 'Please enter both username and password.';
+                return;
+            }
+
+            if (btnSubmitLogin) {
+                btnSubmitLogin.disabled = true;
+                btnSubmitLogin.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Authenticating...';
+            }
+            if (loginErrorMsg) loginErrorMsg.textContent = '';
+
+            fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (btnSubmitLogin) {
+                    btnSubmitLogin.disabled = false;
+                    btnSubmitLogin.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i> Log In to Dashboard';
+                }
+                if (data.error) {
+                    if (loginErrorMsg) loginErrorMsg.textContent = data.error;
+                } else {
+                    currentUser = data.user;
+                    if (loginPortal) loginPortal.style.display = 'none';
+                    if (headerUserBadge) headerUserBadge.style.display = 'flex';
+                    if (userDisplayName) userDisplayName.textContent = currentUser.full_name || currentUser.username;
+                    if (userRoleBadge) {
+                        userRoleBadge.textContent = currentUser.role.toUpperCase();
+                        userRoleBadge.className = currentUser.role === 'admin' ? 'badge badge-primary' : 'badge badge-info';
+                    }
+                    applyRolePermissions(currentUser);
+                    initDashboard();
+                }
+            })
+            .catch(err => {
+                if (btnSubmitLogin) {
+                    btnSubmitLogin.disabled = false;
+                    btnSubmitLogin.innerHTML = '<i class="fa-solid fa-right-to-bracket"></i> Log In to Dashboard';
+                }
+                if (loginErrorMsg) loginErrorMsg.textContent = 'Authentication error: ' + err.message;
+            });
+        });
+    }
+
+    if (btnHeaderLogout) {
+        btnHeaderLogout.addEventListener('click', () => {
+            fetch('/api/auth/logout', { method: 'POST' })
+                .then(() => {
+                    currentUser = null;
+                    if (loginPortal) loginPortal.style.display = 'flex';
+                    if (headerUserBadge) headerUserBadge.style.display = 'none';
+                    if (loginUsernameInput) loginUsernameInput.value = '';
+                    if (loginPasswordInput) loginPasswordInput.value = '';
+                });
+        });
+    }
+
+    function applyRolePermissions(user) {
+        const isDev = (user && user.role === 'developer');
+        const perms = (user && user.permissions) || [];
+        const canWrite = perms.includes('write:keys');
+        const canManageServers = perms.includes('manage:servers');
+
+        const btnOpenAddServer = document.getElementById('btn-open-add-server-modal');
+        if (btnOpenAddServer) btnOpenAddServer.style.display = canManageServers ? 'inline-flex' : 'none';
+
+        if (btnAddKey) btnAddKey.disabled = !canWrite;
+        if (btnRemoveKey) btnRemoveKey.disabled = !canWrite;
+        if (btnPurgeUser) btnPurgeUser.disabled = !canWrite;
+        if (btnDisableUser) btnDisableUser.disabled = !canWrite;
+
+        const writeNotice = document.getElementById('rbac-read-only-banner');
+        if (isDev) {
+            if (!writeNotice) {
+                const banner = document.createElement('div');
+                banner.id = 'rbac-read-only-banner';
+                banner.style.cssText = 'background:rgba(234,179,8,0.1);border:1px solid rgba(234,179,8,0.3);color:#eab308;padding:10px 16px;border-radius:8px;font-size:12px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:10px;grid-column:1/-1;';
+                banner.innerHTML = '<i class="fa-solid fa-eye"></i> <span><strong>Developer Read-Only Mode:</strong> Key modifications, server administration, and unmasked keys are restricted to Administrators.</span>';
+                const statsRow = document.getElementById('stats-row');
+                if (statsRow && statsRow.parentNode) {
+                    statsRow.parentNode.insertBefore(banner, statsRow.nextSibling);
+                }
+            }
+        } else {
+            if (writeNotice) writeNotice.remove();
+        }
+    }
+
+    function initDashboard() {
+        fetchInventory();
+        loadGlobalSearch();
+    }
+
+    /* ============================================================
        HELPERS
     ============================================================ */
     function ts() {
@@ -2542,5 +3131,5 @@ document.addEventListener('DOMContentLoaded', () => {
     /* ============================================================
        INIT
     ============================================================ */
-    fetchInventory();
+    checkAuthSession();
 });

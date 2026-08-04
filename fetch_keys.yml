@@ -17,8 +17,9 @@
         audit_users: >-
           {{ ([target_user | default('')]
             | select('ne', '')
+            | select('ne', 'all')
             | list)
-            if (target_user is defined and target_user != '')
+            if (target_user is defined and target_user != '' and target_user != 'all')
             else (system_users_raw.stdout_lines | default([]) + ['root', 'developer', 'ajay', 'sysadmin', 'ubuntu', 'centos']) | unique | list
           }}
 
@@ -35,11 +36,11 @@
         if [ -f "$keyfile" ]; then
           count=$(grep -cE '^(ssh-|ecdsa-|sk-ssh-)' "$keyfile" 2>/dev/null || echo 0)
           status="active"
-          key_b64=$(cat "$keyfile" 2>/dev/null | base64 | tr -d '\n')
+          key_b64=$(cat "$keyfile" 2>/dev/null | base64 | tr -d '\n' | tr -d '\r' | tr -d ' ')
         elif [ -f "$disabled_file" ]; then
           count=$(grep -cE '^(ssh-|ecdsa-|sk-ssh-)' "$disabled_file" 2>/dev/null || echo 0)
           status="disabled"
-          key_b64=$(cat "$disabled_file" 2>/dev/null | base64 | tr -d '\n')
+          key_b64=$(cat "$disabled_file" 2>/dev/null | base64 | tr -d '\n' | tr -d '\r' | tr -d ' ')
         else
           count=0
           status="none"

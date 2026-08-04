@@ -1,0 +1,37 @@
+
+PLAY [Audit Authorized SSH Keys on Managed Servers] ****************************
+
+TASK [Get all Linux system users from /etc/passwd] *****************************
+[WARNING]: Platform linux on host serv3 is using the discovered Python
+interpreter at /usr/bin/python3.9, but future installation of another Python
+interpreter could change the meaning of that path. See
+https://docs.ansible.com/ansible-
+core/2.17/reference_appendices/interpreter_discovery.html for more information.
+ok: [serv3]
+[WARNING]: Platform linux on host serv2 is using the discovered Python
+interpreter at /usr/bin/python3.9, but future installation of another Python
+interpreter could change the meaning of that path. See
+https://docs.ansible.com/ansible-
+core/2.17/reference_appendices/interpreter_discovery.html for more information.
+ok: [serv2]
+
+TASK [Build list of users to audit] ********************************************
+ok: [serv2]
+ok: [serv3]
+
+TASK [Count authorized_keys for each user] *************************************
+ok: [serv3] => (item=all)
+ok: [serv2] => (item=all)
+
+TASK [Print audit results] *****************************************************
+ok: [serv2] => (item={'changed': False, 'stdout': 'SSHKEYAUDIT|host=serv2|user=all|keys_count=0|status=none|keys_b64=', 'stderr': '', 'rc': 0, 'cmd': 'user="all"\nif [ "$user" = "root" ]; then\n  keyfile="/root/.ssh/authorized_keys"\nelse\n  keyfile="/home/$user/.ssh/authorized_keys"\nfi\ndisabled_file="${keyfile}.sshmanager_disabled"\n\nif [ -f "$keyfile" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$keyfile" 2>/dev/null || echo 0)\n  status="active"\n  key_b64=$(cat "$keyfile" 2>/dev/null | base64 | tr -d \'\\n\')\nelif [ -f "$disabled_file" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$disabled_file" 2>/dev/null || echo 0)\n  status="disabled"\n  key_b64=$(cat "$disabled_file" 2>/dev/null | base64 | tr -d \'\\n\')\nelse\n  count=0\n  status="none"\n  key_b64=""\nfi\necho "SSHKEYAUDIT|host=serv2|user=${user}|keys_count=${count}|status=${status}|keys_b64=${key_b64}"\n', 'start': '2026-07-31 00:38:42.220221', 'end': '2026-07-31 00:38:42.232181', 'delta': '0:00:00.011960', 'msg': '', 'invocation': {'module_args': {'_raw_params': 'user="all"\nif [ "$user" = "root" ]; then\n  keyfile="/root/.ssh/authorized_keys"\nelse\n  keyfile="/home/$user/.ssh/authorized_keys"\nfi\ndisabled_file="${keyfile}.sshmanager_disabled"\n\nif [ -f "$keyfile" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$keyfile" 2>/dev/null || echo 0)\n  status="active"\n  key_b64=$(cat "$keyfile" 2>/dev/null | base64 | tr -d \'\\n\')\nelif [ -f "$disabled_file" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$disabled_file" 2>/dev/null || echo 0)\n  status="disabled"\n  key_b64=$(cat "$disabled_file" 2>/dev/null | base64 | tr -d \'\\n\')\nelse\n  count=0\n  status="none"\n  key_b64=""\nfi\necho "SSHKEYAUDIT|host=serv2|user=${user}|keys_count=${count}|status=${status}|keys_b64=${key_b64}"\n', '_uses_shell': True, 'expand_argument_vars': True, 'stdin_add_newline': True, 'strip_empty_ends': True, 'argv': None, 'chdir': None, 'executable': None, 'creates': None, 'removes': None, 'stdin': None}}, 'stdout_lines': ['SSHKEYAUDIT|host=serv2|user=all|keys_count=0|status=none|keys_b64='], 'stderr_lines': [], 'failed': False, 'failed_when_result': False, 'item': 'all', 'ansible_loop_var': 'item'}) => {
+    "msg": "SSHKEYAUDIT|host=serv2|user=all|keys_count=0|status=none|keys_b64="
+}
+ok: [serv3] => (item={'changed': False, 'stdout': 'SSHKEYAUDIT|host=serv3|user=all|keys_count=0|status=none|keys_b64=', 'stderr': '', 'rc': 0, 'cmd': 'user="all"\nif [ "$user" = "root" ]; then\n  keyfile="/root/.ssh/authorized_keys"\nelse\n  keyfile="/home/$user/.ssh/authorized_keys"\nfi\ndisabled_file="${keyfile}.sshmanager_disabled"\n\nif [ -f "$keyfile" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$keyfile" 2>/dev/null || echo 0)\n  status="active"\n  key_b64=$(cat "$keyfile" 2>/dev/null | base64 | tr -d \'\\n\')\nelif [ -f "$disabled_file" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$disabled_file" 2>/dev/null || echo 0)\n  status="disabled"\n  key_b64=$(cat "$disabled_file" 2>/dev/null | base64 | tr -d \'\\n\')\nelse\n  count=0\n  status="none"\n  key_b64=""\nfi\necho "SSHKEYAUDIT|host=serv3|user=${user}|keys_count=${count}|status=${status}|keys_b64=${key_b64}"\n', 'start': '2026-07-31 00:37:57.348892', 'end': '2026-07-31 00:37:57.358574', 'delta': '0:00:00.009682', 'msg': '', 'invocation': {'module_args': {'_raw_params': 'user="all"\nif [ "$user" = "root" ]; then\n  keyfile="/root/.ssh/authorized_keys"\nelse\n  keyfile="/home/$user/.ssh/authorized_keys"\nfi\ndisabled_file="${keyfile}.sshmanager_disabled"\n\nif [ -f "$keyfile" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$keyfile" 2>/dev/null || echo 0)\n  status="active"\n  key_b64=$(cat "$keyfile" 2>/dev/null | base64 | tr -d \'\\n\')\nelif [ -f "$disabled_file" ]; then\n  count=$(grep -cE \'^(ssh-|ecdsa-|sk-ssh-)\' "$disabled_file" 2>/dev/null || echo 0)\n  status="disabled"\n  key_b64=$(cat "$disabled_file" 2>/dev/null | base64 | tr -d \'\\n\')\nelse\n  count=0\n  status="none"\n  key_b64=""\nfi\necho "SSHKEYAUDIT|host=serv3|user=${user}|keys_count=${count}|status=${status}|keys_b64=${key_b64}"\n', '_uses_shell': True, 'expand_argument_vars': True, 'stdin_add_newline': True, 'strip_empty_ends': True, 'argv': None, 'chdir': None, 'executable': None, 'creates': None, 'removes': None, 'stdin': None}}, 'stdout_lines': ['SSHKEYAUDIT|host=serv3|user=all|keys_count=0|status=none|keys_b64='], 'stderr_lines': [], 'failed': False, 'failed_when_result': False, 'item': 'all', 'ansible_loop_var': 'item'}) => {
+    "msg": "SSHKEYAUDIT|host=serv3|user=all|keys_count=0|status=none|keys_b64="
+}
+
+PLAY RECAP *********************************************************************
+serv2                      : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+serv3                      : ok=4    changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+

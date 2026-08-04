@@ -1,0 +1,99 @@
+---
+- name: Centralized SSH Key Management on Managed Nodes
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  vars:
+    target_user: "developer"      # Default target user
+    ssh_key: ""                   # Public key string
+    key_state: "present"          # 'present', 'absent', 'purge_all', 'disable', 'enable'
+    key_comment: ""               # Comment tag
+
+  tasks:
+    # -----------------------------------------------------------------------
+    # ADD KEY (key_state: present)
+    # -----------------------------------------------------------------------
+    - name: Ensure target user exists
+      ansible.builtin.user:
+        name: "{{ target_user }}"
+        state: present
+        shell: /bin/bash
+        create_home: true
+      when: key_state in ['present']
+
+    - name: Manage authorized_keys for target user (Add / Remove key)
+      ansible.posix.authorized_key:
+        user: "{{ target_user }}"
+        key: "{{ ssh_key }}"
+        state: "{{ key_state }}"
+        comment: "{{ key_comment if (key_state == 'present' and key_comment | default('') != '') else omit }}"
+        exclusive: false
+      when: key_state in ['present', 'absent'] and ssh_key != ""
+
+    # -----------------------------------------------------------------------
+    # PURGE ALL — permanently remove authorized_keys file
+    # -----------------------------------------------------------------------
+    - name: Purge all authorized keys for target user (permanent delete)
+      ansible.builtin.file:
+        path: "{{ ('/root' if target_user == 'root' else '/home/' + target_user) + '/.ssh/authorized_keys' }}"
+        state: absent
+      when: key_state == 'purge_all'
+
+    # -----------------------------------------------------------------------
+    # DISABLE — rename authorized_keys → authorized_keys.sshmanager_disabled
+    # Key is preserved on server. No paste needed to re-enable.
+    # -----------------------------------------------------------------------
+    - name: Disable SSH access — rename authorized_keys (preserve key)
+      ansible.builtin.shell: |
+        KEYFILE="{{ ('/root' if target_user == 'root' else '/home/' + target_user) + '/.ssh/authorized_keys' }}"
+        DISABLED_FILE="${KEYFILE}.sshmanager_disabled"
+        if [ -f "$KEYFILE" ]; then
+          cp "$KEYFILE" "$DISABLED_FILE"
+          > "$KEYFILE"
+          echo "DISABLED: Cleared ${KEYFILE}, backup at ${DISABLED_FILE}"
+        elif [ -f "$DISABLED_FILE" ]; then
+          echo "ALREADY_DISABLED: ${DISABLED_FILE} already exists"
+        else
+          echo "NO_KEY: No authorized_keys found for {{ target_user }}"
+        fi
+      args:
+        executable: /bin/bash
+      register: disable_result
+      changed_when: "'DISABLED:' in disable_result.stdout"
+      when: key_state == 'disable'
+
+    - name: Show disable result
+      ansible.builtin.debug:
+        msg: "{{ disable_result.stdout }}"
+      when: key_state == 'disable' and disable_result is defined
+
+    # -----------------------------------------------------------------------
+    # ENABLE — restore authorized_keys from .sshmanager_disabled backup
+    # Restores the exact original key(s). No paste needed.
+    # -----------------------------------------------------------------------
+    - name: Re-enable SSH access — restore authorized_keys from backup
+      ansible.builtin.shell: |
+        KEYFILE="{{ ('/root' if target_user == 'root' else '/home/' + target_user) + '/.ssh/authorized_keys' }}"
+        DISABLED_FILE="${KEYFILE}.sshmanager_disabled"
+        if [ -f "$DISABLED_FILE" ]; then
+          cp "$DISABLED_FILE" "$KEYFILE"
+          chmod 600 "$KEYFILE"
+          chown {{ target_user }}:{{ target_user }} "$KEYFILE" 2>/dev/null || chown {{ target_user }} "$KEYFILE" 2>/dev/null || true
+          rm -f "$DISABLED_FILE"
+          COUNT=$(grep -cE '^(ssh-|ecdsa-|sk-ssh-)' "$KEYFILE" 2>/dev/null || echo 0)
+          echo "ENABLED: Restored ${KEYFILE} with ${COUNT} keys"
+        elif [ -f "$KEYFILE" ]; then
+          COUNT=$(grep -cE '^(ssh-|ecdsa-|sk-ssh-)' "$KEYFILE" 2>/dev/null || echo 0)
+          echo "ALREADY_ACTIVE: ${KEYFILE} exists with ${COUNT} keys"
+        else
+          echo "NO_BACKUP: No backup file found at ${DISABLED_FILE}"
+        fi
+      args:
+        executable: /bin/bash
+      register: enable_result
+      changed_when: "'ENABLED:' in enable_result.stdout"
+      when: key_state == 'enable'
+
+    - name: Show enable result
+      ansible.builtin.debug:
+        msg: "{{ enable_result.stdout }}"
+      when: key_state == 'enable' and enable_result is defined

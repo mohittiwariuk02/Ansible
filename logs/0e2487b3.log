@@ -1,0 +1,39 @@
+[ERROR]: Unexpected Exception, this is probably a bug: Local RPC server did not start.
+
+Traceback (most recent call last):
+  File "/Users/mohittiwari/Ansible/venv/lib/python3.14/site-packages/ansible/cli/__init__.py", line 663, in cli_executor
+    exit_code = cli.run()
+  File "/Users/mohittiwari/Ansible/venv/lib/python3.14/site-packages/ansible/cli/playbook.py", line 148, in run
+    pbex = PlaybookExecutor(playbooks=context.CLIARGS['args'], inventory=inventory,
+                            variable_manager=variable_manager, loader=loader,
+                            passwords=passwords)
+  File "/Users/mohittiwari/Ansible/venv/lib/python3.14/site-packages/ansible/executor/playbook_executor.py", line 59, in __init__
+    self._tqm = TaskQueueManager(
+                ~~~~~~~~~~~~~~~~^
+        inventory=inventory,
+        ^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        forks=context.CLIARGS.get('forks'),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/mohittiwari/Ansible/venv/lib/python3.14/site-packages/ansible/executor/task_queue_manager.py", line 173, in __init__
+    _rpc_host.LocalManager.shared_instance()  # ensure the RPC host is available
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/Users/mohittiwari/Ansible/venv/lib/python3.14/site-packages/ansible/_internal/_rpc_host.py", line 113, in shared_instance
+    instance.start()
+    ~~~~~~~~~~~~~~^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.5/Frameworks/Python.framework/Versions/3.14/lib/python3.14/multiprocessing/managers.py", line 566, in start
+    self._process.start()
+    ~~~~~~~~~~~~~~~~~~~^^
+  File "/Users/mohittiwari/Ansible/venv/lib/python3.14/site-packages/ansible/_internal/_rpc_host.py", line 51, in start
+    raise TimeoutError("Local RPC server did not start.")
+TimeoutError: Local RPC server did not start.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/mohittiwari/Ansible/venv/lib/python3.14/site-packages/ansible/cli/__init__.py", line 672, in cli_executor
+    raise AnsibleError("Unexpected Exception, this is probably a bug.") from ex
+ansible.errors.AnsibleError: Unexpected Exception, this is probably a bug: Local RPC server did not start.
+

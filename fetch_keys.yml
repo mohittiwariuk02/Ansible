@@ -1,0 +1,58 @@
+---
+- name: Audit Authorized SSH Keys on Managed Servers
+  hosts: "{{ target_hosts | default('all') }}"
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Get all Linux system users from /etc/passwd
+      ansible.builtin.shell: |
+        getent passwd | awk -F: '$6 ~ /\/(home|root)/ {print $1}' | sort -u
+      register: system_users_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Build list of users to audit
+      ansible.builtin.set_fact:
+        audit_users: >-
+          {{ ([target_user | default('')]
+            | select('ne', '')
+            | list)
+            if (target_user is defined and target_user != '')
+            else (system_users_raw.stdout_lines | default([]) + ['root', 'developer', 'ajay', 'sysadmin', 'ubuntu', 'centos']) | unique | list
+          }}
+
+    - name: Count authorized_keys for each user
+      ansible.builtin.shell: |
+        user="{{ item }}"
+        if [ "$user" = "root" ]; then
+          keyfile="/root/.ssh/authorized_keys"
+        else
+          keyfile="/home/$user/.ssh/authorized_keys"
+        fi
+        disabled_file="${keyfile}.sshmanager_disabled"
+        
+        if [ -f "$keyfile" ]; then
+          count=$(grep -cE '^(ssh-|ecdsa-|sk-ssh-)' "$keyfile" 2>/dev/null || echo 0)
+          status="active"
+          key_b64=$(cat "$keyfile" 2>/dev/null | base64 | tr -d '\n')
+        elif [ -f "$disabled_file" ]; then
+          count=$(grep -cE '^(ssh-|ecdsa-|sk-ssh-)' "$disabled_file" 2>/dev/null || echo 0)
+          status="disabled"
+          key_b64=$(cat "$disabled_file" 2>/dev/null | base64 | tr -d '\n')
+        else
+          count=0
+          status="none"
+          key_b64=""
+        fi
+        echo "SSHKEYAUDIT|host={{ inventory_hostname }}|user=${user}|keys_count=${count}|status=${status}|keys_b64=${key_b64}"
+      loop: "{{ audit_users }}"
+      register: key_counts_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Print audit results
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ key_counts_raw.results }}"
+      when: item.stdout is defined and item.stdout != ""

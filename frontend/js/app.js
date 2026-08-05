@@ -1760,6 +1760,114 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btnCloseInspector) btnCloseInspector.addEventListener('click', closeAndRefreshInspector);
     if (modalKeyInspector) modalKeyInspector.addEventListener('click', e => { if (e.target === modalKeyInspector) closeAndRefreshInspector(); });
 
+    // Enterprise Duplicate SSH Key Intelligence Analysis
+    const btnRunDuplicateAnalysis    = document.getElementById('btn-run-duplicate-analysis');
+    const dupSearchInput             = document.getElementById('dup-search-input');
+    const duplicateAnalysisContainer = document.getElementById('duplicate-analysis-container');
+
+    window.openGlobalSearchWithQuery = function(queryStr) {
+        const tabGlobal = document.querySelector('[data-tab="tab-global-search"]');
+        if (tabGlobal) tabGlobal.click();
+        const globalSearchInput = document.getElementById('global-search-input');
+        if (globalSearchInput) {
+            globalSearchInput.value = queryStr;
+            const event = new Event('input', { bubbles: true });
+            globalSearchInput.dispatchEvent(event);
+        }
+    };
+
+    function analyzeDuplicates() {
+        if (!duplicateAnalysisContainer) return;
+        const q = dupSearchInput ? dupSearchInput.value.trim() : '';
+
+        duplicateAnalysisContainer.innerHTML = '<p class="text-center" style="padding:20px;color:var(--text-muted);"><i class="fa-solid fa-spinner fa-spin"></i> Analyzing infrastructure SSH public keys...</p>';
+
+        fetch('/api/keys/analyze_duplicates', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: q })
+        })
+        .then(r => r.json())
+        .then(data => {
+            const groups = data.duplicate_groups || [];
+
+            if (groups.length === 0) {
+                duplicateAnalysisContainer.innerHTML = '<div class="alert alert-success" style="margin-top:10px;"><i class="fa-solid fa-circle-check"></i> No duplicate SSH public keys found matching criteria.</div>';
+                return;
+            }
+
+            let html = `
+                <div style="display:flex;gap:16px;margin-bottom:16px;flex-wrap:wrap;">
+                    <span class="badge badge-warning" style="font-size:12px;padding:6px 12px;"><i class="fa-solid fa-copy"></i> ${data.total_duplicate_groups} Duplicate Key Group(s)</span>
+                    <span class="badge badge-info" style="font-size:12px;padding:6px 12px;"><i class="fa-solid fa-layer-group"></i> ${data.total_duplicate_instances} Total Key Copies Across Infrastructure</span>
+                </div>`;
+
+            groups.forEach((g, idx) => {
+                const scopeBadge = g.same_user_across_hosts 
+                    ? '<span class="badge badge-info" style="font-size:10px;"><i class="fa-solid fa-user"></i> Same User Account Across Servers</span>'
+                    : '<span class="badge badge-warning" style="font-size:10px;"><i class="fa-solid fa-users"></i> Multiple User Accounts</span>';
+
+                let occurrencesHtml = '';
+                g.occurrences.forEach(occ => {
+                    occurrencesHtml += `
+                        <div style="display:flex;align-items:center;justify-content:space-between;background:rgba(0,0,0,0.3);padding:6px 12px;border-radius:4px;margin-bottom:4px;border:1px solid rgba(255,255,255,0.05);font-size:12px;">
+                            <div style="display:flex;align-items:center;gap:10px;">
+                                <span style="color:var(--primary);font-weight:700;"><i class="fa-solid fa-server"></i> ${escapeHtml(occ.host)}</span>
+                                <span style="color:var(--text-muted);">&rarr;</span>
+                                <code style="color:var(--text-main);">${escapeHtml(occ.user)}</code>
+                                <span style="font-size:10.5px;color:var(--text-dim);">(${escapeHtml(occ.home_dir)})</span>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:10px;">
+                                <span style="font-size:11px;color:var(--text-dim);">Synced: ${escapeHtml(occ.last_synced_at)}</span>
+                                <span class="badge badge-success" style="font-size:10px;">${escapeHtml(occ.status)}</span>
+                                <button class="btn btn-outline btn-xs" onclick="openKeyInspectorModal('${occ.host}', '${occ.user}')">Inspect</button>
+                            </div>
+                        </div>`;
+                });
+
+                const copyBtn = g.can_copy_full 
+                    ? `<button class="btn btn-outline btn-xs" onclick="copyTextToClipboard(\`${escapeJS(g.raw_key)}\`)" title="Copy Key"><i class="fa-solid fa-copy"></i> Copy Key</button>` 
+                    : '';
+
+                html += `
+                    <div class="card" style="background:rgba(15,23,42,0.6);border:1px solid rgba(255,255,255,0.08);padding:16px;margin-bottom:16px;border-radius:var(--radius-sm);">
+                        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap;gap:10px;">
+                            <div>
+                                <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px;">
+                                    <strong style="font-size:14px;color:var(--accent-cyan);"><i class="fa-solid fa-key"></i> Key Group #${idx+1}: ${escapeHtml(g.comment)}</strong>
+                                    <span class="badge badge-danger" style="font-size:11px;">${g.total_matches} Copies Found</span>
+                                    ${scopeBadge}
+                                </div>
+                                <code style="font-size:11px;color:var(--text-muted);">${escapeHtml(g.fingerprint)}</code>
+                            </div>
+                            <div style="display:flex;gap:8px;">
+                                ${copyBtn}
+                                <button class="btn btn-primary btn-xs" onclick="openGlobalSearchWithQuery('${escapeJS(g.fingerprint)}')">Search Global</button>
+                            </div>
+                        </div>
+
+                        <!-- Full Unmasked Raw Key Box -->
+                        <div style="font-family:var(--font-mono);font-size:10.5px;color:var(--primary);background:rgba(0,0,0,0.4);padding:8px 10px;border-radius:4px;word-break:break-all;max-height:80px;overflow-y:auto;user-select:all;border:1px solid rgba(255,255,255,0.06);margin-bottom:12px;">
+                            ${escapeHtml(g.raw_key)}
+                        </div>
+
+                        <!-- Occurrences Breakdown -->
+                        <div style="margin-top:10px;">
+                            <div style="font-size:11.5px;font-weight:700;color:var(--text-muted);text-transform:uppercase;margin-bottom:6px;">Infrastructure Occurrences Breakdown</div>
+                            ${occurrencesHtml}
+                        </div>
+                    </div>`;
+            });
+
+            duplicateAnalysisContainer.innerHTML = html;
+        })
+        .catch(() => {
+            duplicateAnalysisContainer.innerHTML = '<div class="alert alert-danger"><i class="fa-solid fa-circle-exclamation"></i> Error running duplicate key analysis.</div>';
+        });
+    }
+
+    if (btnRunDuplicateAnalysis) btnRunDuplicateAnalysis.addEventListener('click', analyzeDuplicates);
+
     // Toolbar actions inside Inspector Modal
     if (btnInspectorGrant) {
         btnInspectorGrant.addEventListener('click', () => {

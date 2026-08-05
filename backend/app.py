@@ -2566,6 +2566,102 @@ def get_sync_change_logs():
 
     return jsonify(rows)
 
+@app.route('/api/keys/analyze_duplicates', methods=['POST', 'GET'])
+@require_perm('read:keys')
+def analyze_duplicate_keys():
+    data = request.json if request.is_json else (request.args or {})
+    query = data.get('query', '').strip()
+    host_filter = data.get('host', '').strip()
+
+    curr_u = get_current_user()
+    user_perms = curr_u.get('permissions', []) if curr_u else []
+    can_view_full = 'view:full_key' in user_perms
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    where_clauses = []
+    params = []
+
+    if query:
+        q_clean = query
+        q_alt = query.replace(' ', '+')
+        q1 = f"%{q_clean}%"
+        q2 = f"%{q_alt}%"
+        where_clauses.append("(fingerprint LIKE %s OR raw_key LIKE %s OR comment LIKE %s OR user LIKE %s OR host LIKE %s OR key_body LIKE %s OR raw_key LIKE %s OR key_body LIKE %s)")
+        params.extend([q1, q1, q1, q1, q1, q1, q2, q2])
+    else:
+        where_clauses.append("is_duplicate = 1")
+
+    if host_filter and host_filter != 'all':
+        where_clauses.append("host = %s")
+        params.append(host_filter)
+
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    cursor.execute(f"SELECT fingerprint, COUNT(*) as cnt FROM ssh_key_cache{where_sql} GROUP BY fingerprint HAVING cnt > 1 ORDER BY cnt DESC", params)
+    dup_fps = cursor.fetchall()
+
+    duplicate_groups = []
+    total_instances = 0
+
+    for row in dup_fps:
+        fp = row['fingerprint']
+        cursor.execute("SELECT id, host, user, home_dir, algorithm, raw_key, fingerprint, comment, status, last_synced_at FROM ssh_key_cache WHERE fingerprint = %s ORDER BY host ASC, user ASC", (fp,))
+        occurrences_rows = cursor.fetchall()
+        
+        if len(occurrences_rows) <= 1 and not query:
+            continue
+
+        total_instances += len(occurrences_rows)
+        sample = occurrences_rows[0]
+        
+        raw_k = sample['raw_key'] if can_view_full else mask_ssh_key(sample['raw_key'])
+
+        hosts_set = sorted(list(set(r['host'] for r in occurrences_rows)))
+        users_set = sorted(list(set(r['user'] for r in occurrences_rows)))
+        same_user = (len(users_set) == 1 and len(hosts_set) > 1)
+
+        occurrences = []
+        timestamps = []
+        for r in occurrences_rows:
+            if r.get('last_synced_at'):
+                timestamps.append(r['last_synced_at'])
+            occurrences.append({
+                "host": r["host"],
+                "user": r["user"],
+                "home_dir": r["home_dir"] or (f"/root" if r["user"] == 'root' else f"/home/{r['user']}"),
+                "status": r["status"],
+                "last_synced_at": format_dt(r.get("last_synced_at"))
+            })
+
+        min_t = format_dt(min(timestamps)) if timestamps else "Unknown"
+        max_t = format_dt(max(timestamps)) if timestamps else "Unknown"
+
+        duplicate_groups.append({
+            "fingerprint": fp,
+            "algorithm": sample["algorithm"],
+            "comment": sample["comment"] or "Authorized Key",
+            "raw_key": raw_k,
+            "total_matches": len(occurrences_rows),
+            "affected_hosts": hosts_set,
+            "affected_users": users_set,
+            "same_user_across_hosts": same_user,
+            "first_detected": min_t,
+            "last_synced": max_t,
+            "occurrences": occurrences,
+            "can_copy_full": can_view_full
+        })
+
+    conn.close()
+
+    return jsonify({
+        "query": query,
+        "total_duplicate_groups": len(duplicate_groups),
+        "total_duplicate_instances": total_instances,
+        "duplicate_groups": duplicate_groups
+    })
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5050))
     print(f"Starting SSH Key Manager Web Service on port {port}...")

@@ -173,7 +173,8 @@ document.addEventListener('DOMContentLoaded', () => {
         'tab-auditor':   { title: 'Authorized Keys Auditor', subtitle: 'Scan and audit existing SSH keys directly from remote servers.' },
         'tab-sharing':   { title: 'Key Sharing Engine', subtitle: 'Securely share existing SSH public keys between managed servers and user accounts.' },
         'tab-sync-engine': { title: 'SSH Key Synchronization Engine', subtitle: 'Asynchronous background synchronization between managed Linux servers and local SQLite cache.' },
-        'tab-history':   { title: 'Operator Audit Log & History', subtitle: 'Full accountability trail of who added, disabled, or revoked access.' }
+        'tab-history':   { title: 'Operator Audit Log & History', subtitle: 'Full accountability trail of who added, disabled, or revoked access.' },
+        'tab-user-management': { title: 'Enterprise User & Access Management', subtitle: 'Manage dashboard users, role assignments, passwords, and account status.' }
     };
 
     navItems.forEach(item => {
@@ -190,13 +191,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 headerSubtitle.textContent = tabMeta[target].subtitle;
             }
 
-            if (target === 'tab-global-search') loadGlobalSearch();
+            if (target === 'tab-global-search') { populateGlobalSearchFilters(); loadGlobalSearch(); }
             if (target === 'tab-user-directory') loadAccessMatrix(false);
             if (target === 'tab-matrix')    loadAccessMatrix(false);
             if (target === 'tab-inventory') loadAccessMatrix(false);
             if (target === 'tab-history')   loadJobHistory();
             if (target === 'tab-sharing')   initSharingModule();
             if (target === 'tab-sync-engine') loadSyncDashboard();
+            if (target === 'tab-user-management') loadUserManagementDashboard();
         });
     });
 
@@ -243,32 +245,48 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function populateGlobalSearchFilters() {
         if (!globalFilterHost) return;
-        globalFilterHost.innerHTML = '<option value="all">All Managed Servers</option>';
-        if (syncSingleHostSelect) syncSingleHostSelect.innerHTML = '<option value="">-- Select Server Host --</option>';
+        const currentHostVal = globalFilterHost.value || 'all';
+        const currentUserVal = globalFilterUser ? globalFilterUser.value || 'all' : 'all';
 
-        (inventoryData.all_hosts || []).forEach(host => {
-            const opt = document.createElement('option');
-            opt.value = host.name;
-            opt.textContent = `${host.name} (${host.ip})`;
-            globalFilterHost.appendChild(opt);
+        fetch('/api/servers/explorer')
+            .then(r => r.json())
+            .then(data => {
+                globalFilterHost.innerHTML = '<option value="all">All Managed Servers</option>';
+                if (syncSingleHostSelect) syncSingleHostSelect.innerHTML = '<option value="">-- Select Server Host --</option>';
 
-            if (syncSingleHostSelect) {
-                const optS = document.createElement('option');
-                optS.value = host.name;
-                optS.textContent = `${host.name} (${host.ip})`;
-                syncSingleHostSelect.appendChild(optS);
-            }
-        });
+                const servers = data.servers || [];
+                servers.forEach(host => {
+                    const opt = document.createElement('option');
+                    opt.value = host.host;
+                    opt.textContent = `${host.host} (${host.ip})`;
+                    globalFilterHost.appendChild(opt);
+
+                    if (syncSingleHostSelect) {
+                        const optS = document.createElement('option');
+                        optS.value = host.host;
+                        optS.textContent = `${host.host} (${host.ip})`;
+                        syncSingleHostSelect.appendChild(optS);
+                    }
+                });
+                globalFilterHost.value = currentHostVal;
+            })
+            .catch(() => {});
 
         if (globalFilterUser) {
-            globalFilterUser.innerHTML = '<option value="all">All User Accounts</option>';
-            const uDir = (fullMatrixData && fullMatrixData.user_directory) || {};
-            Object.keys(uDir).sort().forEach(u => {
-                const opt = document.createElement('option');
-                opt.value = u;
-                opt.textContent = u;
-                globalFilterUser.appendChild(opt);
-            });
+            fetch('/api/servers/users?host=all')
+                .then(r => r.json())
+                .then(data => {
+                    globalFilterUser.innerHTML = '<option value="all">All User Accounts</option>';
+                    const users = data.users || [];
+                    users.forEach(u => {
+                        const opt = document.createElement('option');
+                        opt.value = u;
+                        opt.textContent = u;
+                        globalFilterUser.appendChild(opt);
+                    });
+                    globalFilterUser.value = currentUserVal;
+                })
+                .catch(() => {});
         }
     }
 
@@ -474,30 +492,32 @@ document.addEventListener('DOMContentLoaded', () => {
     function loadAccessMatrix(forceRefresh = false) {
         if (forceRefresh) {
             btnRefreshMatrix.disabled = true;
-            btnRefreshMatrix.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Scanning...';
-            matrixContainer.innerHTML  = '<div class="loading-spinner"><i class="fa-solid fa-circle-notch fa-spin"></i> Running live Ansible SSH key scan...</div>';
+            btnRefreshMatrix.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Refreshing...';
         }
 
-        fetch(forceRefresh ? '/api/matrix?refresh=true' : '/api/matrix')
+        fetch('/api/matrix')
             .then(r => r.json())
             .then(data => {
                 btnRefreshMatrix.disabled = false;
-                btnRefreshMatrix.innerHTML = '<i class="fa-solid fa-rotate"></i> Live Scan Sync';
+                btnRefreshMatrix.innerHTML = '<i class="fa-solid fa-rotate"></i> Refresh Matrix';
                 fullMatrixData     = data;
                 serverUsersSummary = data.server_users_summary || {};
+                if (data.last_synced_at) {
+                    updateHeaderLastSynced(data.last_synced_at);
+                }
                 if (data.inventory && data.inventory.all_hosts) {
                     inventoryData = data.inventory;
                     populateMatrixFilter();
                     renderHostSelector();
                 }
                 renderInventoryTable();
-                renderMatrixGrid(forceRefresh, data.error);
+                renderMatrixGrid(false, data.error);
                 renderUserDirectory(data.user_directory);
                 loadStats();
             })
             .catch(err => {
                 btnRefreshMatrix.disabled = false;
-                btnRefreshMatrix.innerHTML = '<i class="fa-solid fa-rotate"></i> Live Scan Sync';
+                btnRefreshMatrix.innerHTML = '<i class="fa-solid fa-rotate"></i> Refresh Matrix';
                 if (forceRefresh) {
                     matrixContainer.innerHTML = `<div class="error-msg"><i class="fa-solid fa-triangle-exclamation"></i> Error: ${err.message}</div>`;
                 }
@@ -2210,6 +2230,48 @@ document.addEventListener('DOMContentLoaded', () => {
         validationData: null
     };
 
+    function loadServerScopedUsersForSelect(host, selectElem, defaultPrompt, onComplete) {
+        if (!selectElem) return;
+        selectElem.innerHTML = '';
+        const optDefault = document.createElement('option');
+        optDefault.value = '';
+        optDefault.textContent = defaultPrompt || '-- Select User Account --';
+        selectElem.appendChild(optDefault);
+
+        if (!host) {
+            if (onComplete) onComplete();
+            return;
+        }
+
+        fetch('/api/servers/users?host=' + encodeURIComponent(host))
+            .then(r => r.json())
+            .then(data => {
+                selectElem.innerHTML = '';
+                selectElem.appendChild(optDefault);
+
+                const users = data.users || [];
+                if (users.length === 0) {
+                    const optEmpty = document.createElement('option');
+                    optEmpty.value = '';
+                    optEmpty.disabled = true;
+                    optEmpty.textContent = `No synchronized users found on ${host} — run Sync to refresh`;
+                    selectElem.appendChild(optEmpty);
+                } else {
+                    users.forEach(u => {
+                        const opt = document.createElement('option');
+                        opt.value = u;
+                        opt.textContent = `${u} (${data.host})`;
+                        selectElem.appendChild(opt);
+                    });
+                }
+                if (onComplete) onComplete();
+            })
+            .catch(err => {
+                selectElem.innerHTML = `<option value="">Error loading users: ${err.message}</option>`;
+                if (onComplete) onComplete();
+            });
+    }
+
     function initSharingModule() {
         if (!sharingSourceHost) return;
 
@@ -2240,39 +2302,18 @@ document.addEventListener('DOMContentLoaded', () => {
             sharingDestHost.appendChild(optD);
         });
 
-        // Populate Source & Dest User Selects from user directory
-        sharingSourceUser.innerHTML = '';
-        sharingDestUserSelect.innerHTML = '';
+        if (hosts.length > 0) {
+            sharingSourceHost.value = hosts[0].name;
+            sharingDestHost.value = hosts[0].name;
 
-        const optDefaultUser = document.createElement('option');
-        optDefaultUser.value = '';
-        optDefaultUser.textContent = '-- Select User Account --';
-        sharingSourceUser.appendChild(optDefaultUser);
+            loadServerScopedUsersForSelect(hosts[0].name, sharingSourceUser, '-- Select Source User Account --', () => {
+                if (sharingSourceUser.options.length > 1) sharingSourceUser.selectedIndex = 1;
+                loadSharingSourceKeys();
+            });
 
-        const optDefaultDestUser = document.createElement('option');
-        optDefaultDestUser.value = '';
-        optDefaultDestUser.textContent = '-- Select Destination User Account --';
-        sharingDestUserSelect.appendChild(optDefaultDestUser);
-
-        const uDir = (fullMatrixData && fullMatrixData.user_directory) || {};
-        const knownUsers = Object.keys(uDir).sort();
-
-        knownUsers.forEach(u => {
-            const optS = document.createElement('option');
-            optS.value = u;
-            optS.textContent = u;
-            sharingSourceUser.appendChild(optS);
-
-            const optD = document.createElement('option');
-            optD.value = u;
-            optD.textContent = u;
-            sharingDestUserSelect.appendChild(optD);
-        });
-
-        if (knownUsers.length > 0) {
-            sharingSourceUser.value = knownUsers[0];
-            if (hosts.length > 0) sharingSourceHost.value = hosts[0].name;
-            loadSharingSourceKeys();
+            loadServerScopedUsersForSelect(hosts[0].name, sharingDestUserSelect, '-- Select Destination Target User Account --', () => {
+                updateDestSummary();
+            });
         }
     }
 
@@ -2291,12 +2332,12 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        if (sharingKeyCardsGrid) sharingKeyCardsGrid.innerHTML = '<p class="empty-state"><i class="fa-solid fa-circle-notch fa-spin"></i> Reading SSH authorized keys from source server...</p>';
+        if (sharingKeyCardsGrid) sharingKeyCardsGrid.innerHTML = '<p class="empty-state"><i class="fa-solid fa-circle-notch fa-spin"></i> Reading SSH authorized keys from database...</p>';
 
         fetch('/api/keys/inspect', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host: h, user: u, live: true })
+            body: JSON.stringify({ host: h, user: u })
         })
         .then(r => r.json())
         .then(data => {
@@ -2462,7 +2503,29 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    if (sharingDestHost) sharingDestHost.addEventListener('change', updateDestSummary);
+    if (sharingSourceHost) {
+        sharingSourceHost.addEventListener('change', () => {
+            loadServerScopedUsersForSelect(sharingSourceHost.value, sharingSourceUser, '-- Select Source User Account --', () => {
+                if (sharingSourceUser.options.length > 1) sharingSourceUser.selectedIndex = 1;
+                loadSharingSourceKeys();
+            });
+        });
+    }
+
+    if (sharingSourceUser) {
+        sharingSourceUser.addEventListener('change', () => {
+            loadSharingSourceKeys();
+        });
+    }
+
+    if (sharingDestHost) {
+        sharingDestHost.addEventListener('change', () => {
+            loadServerScopedUsersForSelect(sharingDestHost.value, sharingDestUserSelect, '-- Select Destination Target User Account --', () => {
+                updateDestSummary();
+            });
+        });
+    }
+
     if (sharingDestUserSelect) sharingDestUserSelect.addEventListener('change', updateDestSummary);
     if (sharingDestUserCustom) sharingDestUserCustom.addEventListener('input', updateDestSummary);
 
@@ -3198,6 +3261,10 @@ document.addEventListener('DOMContentLoaded', () => {
         const perms = (user && user.permissions) || [];
         const canWrite = perms.includes('write:keys');
         const canManageServers = perms.includes('manage:servers');
+        const canManageUsers = perms.includes('manage:users');
+
+        const navUserMgmt = document.getElementById('nav-user-management');
+        if (navUserMgmt) navUserMgmt.style.display = canManageUsers ? 'flex' : 'none';
 
         const btnOpenAddServer = document.getElementById('btn-open-add-server-modal');
         if (btnOpenAddServer) btnOpenAddServer.style.display = canManageServers ? 'inline-flex' : 'none';
@@ -3222,6 +3289,249 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             if (writeNotice) writeNotice.remove();
         }
+    }
+
+    /* ============================================================
+       USER MANAGEMENT MODULE
+    ============================================================ */
+    const userMgmtSearch       = document.getElementById('user-mgmt-search');
+    const userMgmtRoleFilter   = document.getElementById('user-mgmt-role-filter');
+    const userMgmtStatusFilter = document.getElementById('user-mgmt-status-filter');
+    const userMgmtTableBody    = document.getElementById('user-mgmt-table-body');
+    const btnOpenCreateUser    = document.getElementById('btn-open-create-user-modal');
+    const btnRefreshUserMgmt   = document.getElementById('btn-refresh-user-mgmt');
+
+    const modalUserForm        = document.getElementById('modal-user-form');
+    const userMgmtForm         = document.getElementById('user-mgmt-form');
+    const userFormModalTitle   = document.getElementById('user-form-modal-title');
+    const userFormId           = document.getElementById('user-form-id');
+    const userFormUsername     = document.getElementById('user-form-username');
+    const userFormPassword     = document.getElementById('user-form-password');
+    const userFormPwdGroup     = document.getElementById('user-form-pwd-group');
+    const userFormFullname     = document.getElementById('user-form-fullname');
+    const userFormEmail        = document.getElementById('user-form-email');
+    const userFormRole         = document.getElementById('user-form-role');
+    const userFormStatus       = document.getElementById('user-form-status');
+    const btnCloseUserForm     = document.getElementById('btn-close-user-form');
+    const btnCancelUserForm    = document.getElementById('btn-cancel-user-form');
+
+    const modalResetUserPwd    = document.getElementById('modal-reset-user-pwd');
+    const userResetPwdForm     = document.getElementById('user-reset-pwd-form');
+    const resetPwdUserId       = document.getElementById('reset-pwd-user-id');
+    const resetPwdUsernameLbl  = document.getElementById('reset-pwd-username-label');
+    const resetPwdNewPassword  = document.getElementById('reset-pwd-new-password');
+    const btnCloseResetPwd     = document.getElementById('btn-close-reset-pwd');
+    const btnCancelResetPwd    = document.getElementById('btn-cancel-reset-pwd');
+
+    function loadUserRoles() {
+        if (!userFormRole) return;
+        fetch('/api/roles')
+            .then(r => r.json())
+            .then(roles => {
+                userFormRole.innerHTML = '';
+                roles.forEach(r => {
+                    const opt = document.createElement('option');
+                    opt.value = r.id;
+                    opt.textContent = `${r.role_name === 'admin' ? 'Administrator' : r.role_name === 'developer' ? 'Developer' : r.role_name} - ${r.description}`;
+                    userFormRole.appendChild(opt);
+                });
+            })
+            .catch(() => {});
+    }
+
+    function loadUserManagementDashboard() {
+        if (!userMgmtTableBody) return;
+        const q = userMgmtSearch ? userMgmtSearch.value.trim() : '';
+        const r = userMgmtRoleFilter ? userMgmtRoleFilter.value : 'all';
+        const s = userMgmtStatusFilter ? userMgmtStatusFilter.value : 'all';
+
+        const url = `/api/users?query=${encodeURIComponent(q)}&role=${encodeURIComponent(r)}&status=${encodeURIComponent(s)}`;
+
+        fetch(url)
+            .then(res => {
+                if (!res.ok) throw new Error('Unauthorized');
+                return res.json();
+            })
+            .then(users => {
+                if (users.length === 0) {
+                    userMgmtTableBody.innerHTML = '<tr><td colspan="7" class="text-center" style="padding:16px;color:var(--text-muted);">No dashboard users found.</td></tr>';
+                    return;
+                }
+
+                let html = '';
+                users.forEach(u => {
+                    const roleBadge = (u.role_name === 'admin') 
+                        ? '<span class="badge badge-primary"><i class="fa-solid fa-user-shield"></i> Administrator</span>'
+                        : '<span class="badge badge-info"><i class="fa-solid fa-code"></i> Developer</span>';
+
+                    const statusBadge = u.is_active
+                        ? '<span class="badge badge-success"><i class="fa-solid fa-check"></i> Active</span>'
+                        : '<span class="badge badge-danger"><i class="fa-solid fa-ban"></i> Disabled</span>';
+
+                    const toggleLabel = u.is_active ? 'Disable' : 'Enable';
+                    const toggleClass = u.is_active ? 'btn-warning' : 'btn-success';
+
+                    html += `
+                        <tr>
+                            <td><strong style="color:var(--primary);">${escapeHtml(u.username)}</strong></td>
+                            <td>
+                                <div><strong>${escapeHtml(u.full_name || u.username)}</strong></div>
+                                ${u.email ? `<span style="font-size:11px;color:var(--text-dim);">${escapeHtml(u.email)}</span>` : ''}
+                            </td>
+                            <td>${roleBadge}</td>
+                            <td>${statusBadge}</td>
+                            <td><span style="font-size:11px;color:var(--text-dim);">${escapeHtml(u.last_login_at || 'Never')}</span></td>
+                            <td><span style="font-size:11px;color:var(--text-dim);">${escapeHtml(u.created_at)}</span></td>
+                            <td style="text-align:right;white-space:nowrap;">
+                                <button class="btn btn-outline btn-xs" onclick="openEditUserModal(${u.id}, \`${escapeJS(u.username)}\`, \`${escapeJS(u.full_name)}\`, \`${escapeJS(u.email)}\`, ${u.role_id}, ${u.is_active})" title="Edit user profile"><i class="fa-solid fa-pen"></i> Edit</button>
+                                <button class="btn btn-outline btn-xs" onclick="openResetUserPasswordModal(${u.id}, \`${escapeJS(u.username)}\`)" title="Reset password"><i class="fa-solid fa-key"></i> Password</button>
+                                <button class="btn ${toggleClass} btn-xs" onclick="toggleUserStatus(${u.id})" title="${toggleLabel} user">${toggleLabel}</button>
+                                ${u.username !== 'admin' ? `<button class="btn btn-danger btn-xs" onclick="deleteUserAccount(${u.id}, \`${escapeJS(u.username)}\`)" title="Delete user"><i class="fa-solid fa-trash"></i></button>` : ''}
+                            </td>
+                        </tr>`;
+                });
+                userMgmtTableBody.innerHTML = html;
+            })
+            .catch(() => {
+                userMgmtTableBody.innerHTML = '<tr><td colspan="7" class="text-center" style="padding:16px;color:var(--danger);">Access Restricted. Administrator role required for User Management.</td></tr>';
+            });
+    }
+
+    if (userMgmtSearch) userMgmtSearch.addEventListener('input', loadUserManagementDashboard);
+    if (userMgmtRoleFilter) userMgmtRoleFilter.addEventListener('change', loadUserManagementDashboard);
+    if (userMgmtStatusFilter) userMgmtStatusFilter.addEventListener('change', loadUserManagementDashboard);
+    if (btnRefreshUserMgmt) btnRefreshUserMgmt.addEventListener('click', loadUserManagementDashboard);
+
+    if (btnOpenCreateUser) {
+        btnOpenCreateUser.addEventListener('click', () => {
+            loadUserRoles();
+            userFormId.value = '';
+            userFormUsername.value = '';
+            userFormUsername.disabled = false;
+            userFormPassword.value = '';
+            userFormPassword.required = true;
+            if (userFormPwdGroup) userFormPwdGroup.style.display = 'block';
+            userFormFullname.value = '';
+            userFormEmail.value = '';
+            userFormStatus.value = '1';
+            userFormModalTitle.innerHTML = '<i class="fa-solid fa-user-plus"></i> Create Dashboard User';
+            modalUserForm.classList.add('active');
+        });
+    }
+
+    window.openEditUserModal = function(id, username, fullname, email, roleId, isActive) {
+        loadUserRoles();
+        userFormId.value = id;
+        userFormUsername.value = username;
+        userFormUsername.disabled = true;
+        userFormPassword.value = '';
+        userFormPassword.required = false;
+        if (userFormPwdGroup) userFormPwdGroup.style.display = 'none';
+        userFormFullname.value = fullname || '';
+        userFormEmail.value = email || '';
+        userFormRole.value = roleId;
+        userFormStatus.value = isActive ? '1' : '0';
+        userFormModalTitle.innerHTML = `<i class="fa-solid fa-user-pen"></i> Edit User: ${escapeHtml(username)}`;
+        modalUserForm.classList.add('active');
+    };
+
+    window.openResetUserPasswordModal = function(id, username) {
+        resetPwdUserId.value = id;
+        resetPwdUsernameLbl.textContent = username;
+        resetPwdNewPassword.value = '';
+        modalResetUserPwd.classList.add('active');
+    };
+
+    window.toggleUserStatus = function(id) {
+        fetch(`/api/users/${id}/toggle_status`, { method: 'POST' })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                loadUserManagementDashboard();
+            });
+    };
+
+    window.deleteUserAccount = function(id, username) {
+        if (!confirm(`Delete dashboard user account '${username}'? This operation cannot be undone.`)) return;
+        fetch(`/api/users/${id}`, { method: 'DELETE' })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                loadUserManagementDashboard();
+            });
+    };
+
+    if (btnCloseUserForm) btnCloseUserForm.addEventListener('click', () => modalUserForm.classList.remove('active'));
+    if (btnCancelUserForm) btnCancelUserForm.addEventListener('click', () => modalUserForm.classList.remove('active'));
+
+    if (userMgmtForm) {
+        userMgmtForm.addEventListener('submit', e => {
+            e.preventDefault();
+            const uid = userFormId.value;
+            const isEdit = Boolean(uid);
+
+            const payload = {
+                username: userFormUsername.value.trim(),
+                full_name: userFormFullname.value.trim(),
+                email: userFormEmail.value.trim(),
+                role_id: parseInt(userFormRole.value),
+                is_active: userFormStatus.value === '1'
+            };
+
+            if (!isEdit) {
+                payload.password = userFormPassword.value.trim();
+            }
+
+            const url = isEdit ? `/api/users/${uid}` : '/api/users/create';
+            const method = isEdit ? 'PUT' : 'POST';
+
+            fetch(url, {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                modalUserForm.classList.remove('active');
+                loadUserManagementDashboard();
+            });
+        });
+    }
+
+    if (btnCloseResetPwd) btnCloseResetPwd.addEventListener('click', () => modalResetUserPwd.classList.remove('active'));
+    if (btnCancelResetPwd) btnCancelResetPwd.addEventListener('click', () => modalResetUserPwd.classList.remove('active'));
+
+    if (userResetPwdForm) {
+        userResetPwdForm.addEventListener('submit', e => {
+            e.preventDefault();
+            const uid = resetPwdUserId.value;
+            const newPwd = resetPwdNewPassword.value.trim();
+
+            fetch(`/api/users/${uid}/reset_password`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ new_password: newPwd })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
+                alert(data.message);
+                modalResetUserPwd.classList.remove('active');
+            });
+        });
     }
 
     function initDashboard() {

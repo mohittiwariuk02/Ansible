@@ -15,6 +15,7 @@ from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import Flask, request, jsonify, Response, send_from_directory, session
 from flask_cors import CORS
+import shutil
 
 import pymysql
 from pymysql.cursors import DictCursor
@@ -232,12 +233,30 @@ def init_db():
                 username VARCHAR(100) UNIQUE NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
                 full_name VARCHAR(255) DEFAULT '',
+                email VARCHAR(255) DEFAULT '',
                 role_id INT NOT NULL,
                 is_active TINYINT(1) DEFAULT 1,
+                created_by VARCHAR(100) DEFAULT 'System',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                last_login_at DATETIME NULL,
+                password_changed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (role_id) REFERENCES roles(id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         ''')
+
+        cols_to_add = [
+            ("email", "VARCHAR(255) DEFAULT ''"),
+            ("created_by", "VARCHAR(100) DEFAULT 'System'"),
+            ("updated_at", "DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
+            ("last_login_at", "DATETIME NULL"),
+            ("password_changed_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
+        ]
+        for col_name, col_def in cols_to_add:
+            try:
+                cursor.execute(f"ALTER TABLE app_users ADD COLUMN {col_name} {col_def}")
+            except Exception:
+                pass
 
         # Seed Default Roles
         cursor.execute("INSERT IGNORE INTO roles (id, role_name, description) VALUES (1, 'admin', 'Administrator with full system access'), (2, 'developer', 'Developer with read-only access and masked keys')")
@@ -264,7 +283,7 @@ def init_db():
 
         # Seed Default Admin User ('admin' / 'admin123')
         admin_hash = generate_password_hash('admin123')
-        cursor.execute("INSERT IGNORE INTO app_users (username, password_hash, full_name, role_id, is_active) VALUES ('admin', %s, 'Administrator', 1, 1)", (admin_hash,))
+        cursor.execute("INSERT IGNORE INTO app_users (username, password_hash, full_name, role_id, is_active, created_by) VALUES ('admin', %s, 'Administrator', 1, 1, 'System')", (admin_hash,))
 
         conn.close()
     except Exception as e:
@@ -553,6 +572,91 @@ def parse_inventory(path):
 
     return {"groups": groups, "all_hosts": all_hosts}
 
+def sanitize_ansible_group_name(raw_name):
+    """
+    Sanitize user-provided group names into Ansible-compatible group identifiers.
+    Ansible group names must match ^[a-zA-Z_][a-zA-Z0-9_]*$ (INI group headers).
+    Example: 'Mail Server' -> 'mail_server'
+             'Web & DB 10.0' -> 'web_db_10_0'
+             '10.0-servers' -> 'group_10_0_servers'
+    """
+    if not raw_name or not isinstance(raw_name, str):
+        return "web_servers"
+    
+    clean = raw_name.strip()
+    if not clean:
+        return "web_servers"
+
+    clean = re.sub(r'[^a-zA-Z0-9_]', '_', clean)
+    clean = re.sub(r'_+', '_', clean).strip('_')
+
+    if not clean:
+        return "web_servers"
+
+    if clean[0].isdigit():
+        clean = f"group_{clean}"
+
+    return clean.lower()
+
+def validate_inventory_host(hostname, ip=None):
+    """Validate server hostname and IP address syntax."""
+    if not hostname or not isinstance(hostname, str):
+        return False, "Server hostname cannot be empty."
+
+    hostname = hostname.strip()
+    if len(hostname) > 255:
+        return False, "Server hostname is too long (max 255 chars)."
+
+    if not re.match(r'^[a-zA-Z0-9_.-]+$', hostname):
+        return False, f"Invalid hostname '{hostname}'. Hostnames may only contain alphanumeric characters, hyphens, dots, and underscores."
+
+    if ip and isinstance(ip, str) and ip.strip():
+        ip_clean = ip.strip()
+        if not re.match(r'^[a-zA-Z0-9_.-]+$', ip_clean):
+            return False, f"Invalid IP/address format '{ip_clean}'."
+
+    return True, ""
+
+def validate_ansible_inventory_file(path):
+    """
+    Perform pre-flight verification of Ansible inventory file.
+    Validates INI syntax and executes `ansible-inventory --list` to ensure Ansible parser compatibility.
+    Returns (is_valid: bool, error_message: str).
+    """
+    if not os.path.exists(path):
+        return False, f"Inventory file does not exist at '{path}'."
+
+    try:
+        with open(path, "r") as f:
+            lines = f.readlines()
+        
+        for line_num, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+                continue
+            if stripped.startswith("["):
+                if not stripped.endswith("]"):
+                    return False, f"Syntax Error on line {line_num}: Unclosed section header '{stripped}'."
+                section_name = stripped[1:-1].strip()
+                base_sec = section_name.split(":")[0]
+                if not re.match(r'^[a-zA-Z0-9_-]+$', base_sec):
+                    return False, f"Invalid Ansible section entry '[{section_name}]' on line {line_num}. Group names cannot contain spaces or special characters."
+    except Exception as e:
+        return False, f"Failed reading inventory file: {str(e)}"
+
+    try:
+        ansible_bin = os.path.join(BASE_DIR, "venv", "bin", "ansible-inventory")
+        if not os.path.exists(ansible_bin):
+            ansible_bin = shutil.which("ansible-inventory") or "ansible-inventory"
+        res = subprocess.run([ansible_bin, "-i", path, "--list"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=BASE_DIR, env=get_env(), timeout=10)
+        if res.returncode != 0:
+            err_line = res.stdout.strip().splitlines()[0] if res.stdout else f"Exit code {res.returncode}"
+            return False, f"Ansible Inventory Validation Error: {err_line}"
+    except Exception as e:
+        print(f"Notice running ansible-inventory validation: {e}")
+
+    return True, ""
+
 def validate_ssh_public_key(key):
     key = key.strip()
     if not key:
@@ -826,6 +930,16 @@ def ping_servers():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # Auth & Session Routes
+@app.route('/api/roles', methods=['GET'])
+@require_auth
+def list_roles():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, role_name, description FROM roles ORDER BY id ASC")
+    roles = cursor.fetchall()
+    conn.close()
+    return jsonify(roles)
+
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.json or {}
@@ -838,16 +952,37 @@ def login():
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT u.id, u.username, u.password_hash, u.full_name, u.role_id, r.role_name, u.is_active
+        SELECT u.id, u.username, u.password_hash, u.full_name, u.email, u.role_id, r.role_name, u.is_active
         FROM app_users u
         JOIN roles r ON u.role_id = r.id
         WHERE u.username = %s
     ''', (username,))
     user = cursor.fetchone()
-    conn.close()
 
-    if not user or not user['is_active'] or not check_password_hash(user['password_hash'], password):
+    if not user or not check_password_hash(user['password_hash'], password):
+        conn.close()
+        try:
+            conn_log = get_db_connection()
+            cursor_log = conn_log.cursor()
+            cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                               ('AUTH_LOG', username or 'Unknown', 'localhost', username or 'Unknown', 'LOGIN_FAILURE', 'FAILED', '401 Unauthorized', f"Failed login attempt for username '{username}'"))
+            conn_log.close()
+        except Exception: pass
         return jsonify({"error": "Invalid username or password."}), 401
+
+    if not user['is_active']:
+        conn.close()
+        try:
+            conn_log = get_db_connection()
+            cursor_log = conn_log.cursor()
+            cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                               ('AUTH_LOG', username, 'localhost', username, 'LOGIN_BLOCKED', 'ACTIVE', 'DISABLED', f"Blocked login attempt for disabled user account '{username}'"))
+            conn_log.close()
+        except Exception: pass
+        return jsonify({"error": "User account is disabled. Please contact system administrator."}), 403
+
+    cursor.execute("UPDATE app_users SET last_login_at = NOW() WHERE id = %s", (user['id'],))
+    conn.close()
 
     session.permanent = True
     session['user_id'] = user['id']
@@ -856,6 +991,14 @@ def login():
 
     perms = list(get_user_permissions(user['id']))
 
+    try:
+        conn_log = get_db_connection()
+        cursor_log = conn_log.cursor()
+        cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           ('AUTH_LOG', user['username'], 'localhost', user['username'], 'LOGIN_SUCCESS', 'OFFLINE', 'ONLINE', f"Successful login for user '{user['username']}' ({user['role_name']})"))
+        conn_log.close()
+    except Exception: pass
+
     return jsonify({
         "status": "success",
         "message": f"Welcome back, {user['full_name']}!",
@@ -863,6 +1006,7 @@ def login():
             "id": user['id'],
             "username": user['username'],
             "full_name": user['full_name'],
+            "email": user.get('email', ''),
             "role": user['role_name'],
             "permissions": perms
         }
@@ -870,6 +1014,15 @@ def login():
 
 @app.route('/api/auth/logout', methods=['POST'])
 def logout():
+    curr_u = get_current_user()
+    if curr_u:
+        try:
+            conn_log = get_db_connection()
+            cursor_log = conn_log.cursor()
+            cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                               ('AUTH_LOG', curr_u['username'], 'localhost', curr_u['username'], 'LOGOUT', 'ONLINE', 'OFFLINE', f"User '{curr_u['username']}' logged out"))
+            conn_log.close()
+        except Exception: pass
     session.clear()
     return jsonify({"status": "success", "message": "Successfully logged out."})
 
@@ -884,6 +1037,7 @@ def auth_me():
             "id": user['id'],
             "username": user['username'],
             "full_name": user['full_name'],
+            "email": user.get('email', ''),
             "role": user['role_name'],
             "permissions": user['permissions']
         }
@@ -892,18 +1046,50 @@ def auth_me():
 @app.route('/api/users', methods=['GET'])
 @require_perm('manage:users')
 def list_dashboard_users():
+    query = request.args.get('query', '').strip()
+    role_filter = request.args.get('role', '').strip()
+    status_filter = request.args.get('status', '').strip()
+
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT u.id, u.username, u.full_name, u.role_id, r.role_name, u.is_active, u.created_at
+
+    where_clauses = []
+    params = []
+
+    if query:
+        q = f"%{query}%"
+        where_clauses.append("(u.username LIKE %s OR u.full_name LIKE %s OR u.email LIKE %s)")
+        params.extend([q, q, q])
+
+    if role_filter and role_filter != 'all':
+        where_clauses.append("r.role_name = %s")
+        params.append(role_filter)
+
+    if status_filter and status_filter != 'all':
+        if status_filter == 'active':
+            where_clauses.append("u.is_active = 1")
+        elif status_filter == 'disabled':
+            where_clauses.append("u.is_active = 0")
+
+    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    cursor.execute(f'''
+        SELECT u.id, u.username, u.full_name, u.email, u.role_id, r.role_name, r.description as role_description, 
+               u.is_active, u.created_by, u.created_at, u.updated_at, u.last_login_at, u.password_changed_at
         FROM app_users u
         JOIN roles r ON u.role_id = r.id
+        {where_sql}
         ORDER BY u.id ASC
-    ''')
+    ''', params)
     users = cursor.fetchall()
     conn.close()
+
     for u in users:
         u['created_at'] = format_dt(u.get('created_at'))
+        u['updated_at'] = format_dt(u.get('updated_at'))
+        u['last_login_at'] = format_dt(u.get('last_login_at')) if u.get('last_login_at') else 'Never'
+        u['password_changed_at'] = format_dt(u.get('password_changed_at'))
+
     return jsonify(users)
 
 @app.route('/api/users/create', methods=['POST'])
@@ -913,7 +1099,12 @@ def create_dashboard_user():
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
     full_name = data.get('full_name', '').strip() or username
+    email = data.get('email', '').strip()
     role_id = int(data.get('role_id', 2))
+    is_active = 1 if data.get('is_active', True) else 0
+
+    curr_admin = get_current_user()
+    created_by = curr_admin['username'] if curr_admin else 'Admin'
 
     if not username or not password:
         return jsonify({"error": "Username and password are required."}), 400
@@ -925,14 +1116,176 @@ def create_dashboard_user():
         conn.close()
         return jsonify({"error": f"Username '{username}' already exists."}), 400
 
+    cursor.execute("SELECT role_name FROM roles WHERE id = %s", (role_id,))
+    role_row = cursor.fetchone()
+    role_name = role_row['role_name'] if role_row else f"Role #{role_id}"
+
     pwd_hash = generate_password_hash(password)
     cursor.execute('''
-        INSERT INTO app_users (username, password_hash, full_name, role_id, is_active)
-        VALUES (%s, %s, %s, %s, 1)
-    ''', (username, pwd_hash, full_name, role_id))
+        INSERT INTO app_users (username, password_hash, full_name, email, role_id, is_active, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ''', (username, pwd_hash, full_name, email, role_id, is_active, created_by))
     conn.close()
 
-    return jsonify({"status": "success", "message": f"User '{username}' created successfully."})
+    try:
+        conn_log = get_db_connection()
+        cursor_log = conn_log.cursor()
+        cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           ('USER_MGMT', created_by, 'dashboard', username, 'USER_CREATED', 'None', f"Role: {role_name}, Status: {'Active' if is_active else 'Disabled'}", f"Created new application user account '{username}' ({role_name})"))
+        conn_log.close()
+    except Exception: pass
+
+    return jsonify({"status": "success", "message": f"Dashboard user '{username}' created successfully."})
+
+@app.route('/api/users/<int:user_id>', methods=['PUT'])
+@require_perm('manage:users')
+def update_dashboard_user(user_id):
+    data = request.json or {}
+    full_name = data.get('full_name', '').strip()
+    email = data.get('email', '').strip()
+    role_id = int(data.get('role_id', 2))
+    is_active = 1 if data.get('is_active', True) else 0
+
+    curr_admin = get_current_user()
+    op_name = curr_admin['username'] if curr_admin else 'Admin'
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT u.id, u.username, u.full_name, u.email, u.role_id, r.role_name, u.is_active FROM app_users u JOIN roles r ON u.role_id = r.id WHERE u.id = %s", (user_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    cursor.execute("SELECT role_name FROM roles WHERE id = %s", (role_id,))
+    new_role_row = cursor.fetchone()
+    new_role_name = new_role_row['role_name'] if new_role_row else f"Role #{role_id}"
+
+    cursor.execute('''
+        UPDATE app_users SET
+            full_name = %s,
+            email = %s,
+            role_id = %s,
+            is_active = %s
+        WHERE id = %s
+    ''', (full_name or existing['username'], email, role_id, is_active, user_id))
+    conn.close()
+
+    try:
+        conn_log = get_db_connection()
+        cursor_log = conn_log.cursor()
+        desc = f"Updated user '{existing['username']}' profile"
+        if existing['role_id'] != role_id:
+            desc += f" (Role changed from {existing['role_name']} to {new_role_name})"
+        if existing['is_active'] != is_active:
+            desc += f" (Status changed to {'Active' if is_active else 'Disabled'})"
+        cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           ('USER_MGMT', op_name, 'dashboard', existing['username'], 'USER_UPDATED', f"{existing['role_name']} ({'Active' if existing['is_active'] else 'Disabled'})", f"{new_role_name} ({'Active' if is_active else 'Disabled'})", desc))
+        conn_log.close()
+    except Exception: pass
+
+    return jsonify({"status": "success", "message": f"User '{existing['username']}' updated successfully."})
+
+@app.route('/api/users/<int:user_id>/reset_password', methods=['POST'])
+@require_perm('manage:users')
+def reset_dashboard_user_password(user_id):
+    data = request.json or {}
+    new_password = data.get('new_password', '').strip()
+
+    if not new_password:
+        return jsonify({"error": "New password is required."}), 400
+
+    curr_admin = get_current_user()
+    op_name = curr_admin['username'] if curr_admin else 'Admin'
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username FROM app_users WHERE id = %s", (user_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    pwd_hash = generate_password_hash(new_password)
+    cursor.execute("UPDATE app_users SET password_hash = %s, password_changed_at = NOW() WHERE id = %s", (pwd_hash, user_id))
+    conn.close()
+
+    try:
+        conn_log = get_db_connection()
+        cursor_log = conn_log.cursor()
+        cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           ('USER_MGMT', op_name, 'dashboard', existing['username'], 'PASSWORD_RESET', 'Old Password Hash', 'New Password Hash', f"Reset password for dashboard user '{existing['username']}'"))
+        conn_log.close()
+    except Exception: pass
+
+    return jsonify({"status": "success", "message": f"Password for user '{existing['username']}' reset successfully."})
+
+@app.route('/api/users/<int:user_id>/toggle_status', methods=['POST'])
+@require_perm('manage:users')
+def toggle_dashboard_user_status(user_id):
+    curr_admin = get_current_user()
+    op_name = curr_admin['username'] if curr_admin else 'Admin'
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username, is_active FROM app_users WHERE id = %s", (user_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    if existing['username'] == 'admin' and existing['is_active'] == 1:
+        conn.close()
+        return jsonify({"error": "Cannot disable default primary 'admin' account."}), 400
+
+    new_status = 0 if existing['is_active'] == 1 else 1
+    cursor.execute("UPDATE app_users SET is_active = %s WHERE id = %s", (new_status, user_id))
+    conn.close()
+
+    action_type = 'USER_DISABLED' if new_status == 0 else 'USER_ENABLED'
+    status_label = 'Disabled' if new_status == 0 else 'Active'
+
+    try:
+        conn_log = get_db_connection()
+        cursor_log = conn_log.cursor()
+        cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           ('USER_MGMT', op_name, 'dashboard', existing['username'], action_type, 'Active' if existing['is_active'] else 'Disabled', status_label, f"Toggled user account status to '{status_label}' for '{existing['username']}'"))
+        conn_log.close()
+    except Exception: pass
+
+    return jsonify({"status": "success", "message": f"User '{existing['username']}' status set to {status_label}."})
+
+@app.route('/api/users/<int:user_id>', methods=['DELETE'])
+@require_perm('manage:users')
+def delete_dashboard_user(user_id):
+    curr_admin = get_current_user()
+    op_name = curr_admin['username'] if curr_admin else 'Admin'
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username FROM app_users WHERE id = %s", (user_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return jsonify({"error": "User account not found."}), 404
+
+    if existing['username'] == 'admin':
+        conn.close()
+        return jsonify({"error": "Cannot delete primary 'admin' account."}), 400
+
+    cursor.execute("DELETE FROM app_users WHERE id = %s", (user_id,))
+    conn.close()
+
+    try:
+        conn_log = get_db_connection()
+        cursor_log = conn_log.cursor()
+        cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           ('USER_MGMT', op_name, 'dashboard', existing['username'], 'USER_DELETED', 'Active User', 'Deleted', f"Deleted dashboard user account '{existing['username']}'"))
+        conn_log.close()
+    except Exception: pass
+
+    return jsonify({"status": "success", "message": f"User '{existing['username']}' deleted successfully."})
 
 @app.route('/api/keys/deploy', methods=['POST'])
 @require_perm('write:keys')
@@ -1031,166 +1384,77 @@ def deploy_key():
 
 @app.route('/api/matrix', methods=['GET'])
 def get_access_matrix():
-    force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+    reconcile_database_with_inventory()
     inventory = parse_inventory(INVENTORY_PATH)
 
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    if not force_refresh:
-        cursor.execute("SELECT host, user, keys_count, has_access, status, keys_text FROM access_cache")
-        rows = cursor.fetchall()
-        conn.close()
+    cursor.execute("SELECT host, user, keys_count, has_access, status, keys_text, updated_at FROM access_cache")
+    rows = cursor.fetchall()
 
-        matrix = {}
-        server_users_summary = {}
-        user_directory = {}
-
-        for row in rows:
-            h = row["host"]
-            u = row["user"]
-            c = row["keys_count"]
-            s = row["status"] if row.get("status") else ("active" if row["has_access"] else "none")
-            kt = row["keys_text"] if row.get("keys_text") else ""
-            kl = parse_authorized_keys_text(kt)
-
-            if h not in matrix:
-                matrix[h] = {}
-                server_users_summary[h] = []
-            matrix[h][u] = {
-                "keys_count": len(kl) if kl else c,
-                "has_access": s == "active",
-                "status": s,
-                "keys_text": kt,
-                "keys_list": kl
-            }
-            if s == "active" and u not in server_users_summary[h]:
-                server_users_summary[h].append(u)
-
-            if u not in user_directory:
-                user_directory[u] = {
-                    "servers": {},
-                    "active_hosts_count": 0,
-                    "has_key": False,
-                    "keys_text": "",
-                    "keys_list": []
-                }
-            user_directory[u]["servers"][h] = {
-                "status": s,
-                "keys_count": len(kl) if kl else c,
-                "has_access": s == "active",
-                "keys_list": kl
-            }
-            if s == "active":
-                user_directory[u]["active_hosts_count"] += 1
-            if kt:
-                user_directory[u]["has_key"] = True
-                if not user_directory[u]["keys_text"]:
-                    user_directory[u]["keys_text"] = kt
-                    user_directory[u]["keys_list"] = kl
-
-        return jsonify({
-            "inventory": inventory,
-            "matrix": matrix,
-            "server_users_summary": server_users_summary,
-            "user_directory": user_directory,
-            "source": "cache",
-            "timestamp": datetime.now().isoformat()
-        })
+    cursor.execute("SELECT MAX(updated_at) as max_scan FROM access_cache")
+    m_row = cursor.fetchone()
+    last_synced_at = format_dt(m_row['max_scan']) if m_row and m_row.get('max_scan') else 'Never'
 
     conn.close()
-    cmd = [
-        ANSIBLE_BIN,
-        "-i", INVENTORY_PATH,
-        FETCH_PLAYBOOK,
-        "--extra-vars", json.dumps({"target_user": "", "target_hosts": "all"})
-    ]
 
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=BASE_DIR, env=get_env(), timeout=120)
-        output = res.stdout
+    matrix = {}
+    server_users_summary = {}
+    user_directory = {}
 
-        matrix = {}
-        server_users_summary = {}
-        user_directory = {}
+    for row in rows:
+        h = row["host"]
+        u = row["user"]
+        c = row["keys_count"]
+        s = row["status"] if row.get("status") else ("active" if row["has_access"] else "none")
+        kt = row["keys_text"] if row.get("keys_text") else ""
+        kl = parse_authorized_keys_text(kt)
 
-        for line in output.splitlines():
-            line = line.strip().strip('"').strip("'")
-            if 'SSHKEYAUDIT|' in line:
-                idx = line.index('SSHKEYAUDIT|')
-                audit_line = line[idx:]
-                parts = audit_line.split('|')
-                data = {}
-                for p in parts[1:]:
-                    if '=' in p:
-                        k, v = p.split('=', 1)
-                        data[k.strip()] = v.strip()
-                host = data.get('host', '').strip()
-                user = data.get('user', '').strip()
-                try:
-                    count = int(data.get('keys_count', 0))
-                except ValueError:
-                    count = 0
+        if h not in matrix:
+            matrix[h] = {}
+            server_users_summary[h] = []
+        matrix[h][u] = {
+            "keys_count": len(kl) if kl else c,
+            "has_access": s == "active",
+            "status": s,
+            "keys_text": kt,
+            "keys_list": kl
+        }
+        if s == "active" and u not in server_users_summary[h]:
+            server_users_summary[h].append(u)
 
-                status = data.get('status', 'active' if count > 0 else 'none').strip()
-                keys_b64 = data.get('keys_b64', '').strip()
-                keys_text = ""
-                if keys_b64:
-                    keys_text = safe_b64decode(keys_b64)
+        if u not in user_directory:
+            user_directory[u] = {
+                "servers": {},
+                "active_hosts_count": 0,
+                "has_key": False,
+                "keys_text": "",
+                "keys_list": []
+            }
+        user_directory[u]["servers"][h] = {
+            "status": s,
+            "keys_count": len(kl) if kl else c,
+            "has_access": s == "active",
+            "keys_list": kl
+        }
+        if s == "active":
+            user_directory[u]["active_hosts_count"] += 1
+        if kt:
+            user_directory[u]["has_key"] = True
+            if not user_directory[u]["keys_text"]:
+                user_directory[u]["keys_text"] = kt
+                user_directory[u]["keys_list"] = kl
 
-                keys_list = parse_authorized_keys_text(keys_text)
-                final_count = len(keys_list) if keys_list else count
-
-                if host and user:
-                    if host not in matrix:
-                        matrix[host] = {}
-                        server_users_summary[host] = []
-                    matrix[host][user] = {
-                        "keys_count": final_count,
-                        "has_access": status == "active",
-                        "status": status,
-                        "keys_text": keys_text,
-                        "keys_list": keys_list
-                    }
-                    if status == "active" and user not in server_users_summary[host]:
-                        server_users_summary[host].append(user)
-
-                    if user not in user_directory:
-                        user_directory[user] = {
-                            "servers": {},
-                            "active_hosts_count": 0,
-                            "has_key": False,
-                            "keys_text": "",
-                            "keys_list": []
-                        }
-                    user_directory[user]["servers"][host] = {
-                        "status": status,
-                        "keys_count": final_count,
-                        "has_access": status == "active",
-                        "keys_list": keys_list
-                    }
-                    if status == "active":
-                        user_directory[user]["active_hosts_count"] += 1
-                    if keys_text:
-                        user_directory[user]["has_key"] = True
-                        if not user_directory[user]["keys_text"]:
-                            user_directory[user]["keys_text"] = keys_text
-                            user_directory[user]["keys_list"] = keys_list
-
-                    update_access_cache(host, user, final_count, status=status, keys_text=keys_text)
-
-        return jsonify({
-            "inventory": inventory,
-            "matrix": matrix,
-            "server_users_summary": server_users_summary,
-            "user_directory": user_directory,
-            "source": "live_scan",
-            "timestamp": datetime.now().isoformat()
-        })
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Ansible scan timed out after 120s. Check server connectivity.", "inventory": inventory}), 500
-    except Exception as e:
-        return jsonify({"error": str(e), "inventory": inventory}), 500
+    return jsonify({
+        "inventory": inventory,
+        "matrix": matrix,
+        "server_users_summary": server_users_summary,
+        "user_directory": user_directory,
+        "source": "cache",
+        "last_synced_at": last_synced_at,
+        "timestamp": datetime.now().isoformat()
+    })
 
 @app.route('/api/keys/grant_access', methods=['POST'])
 @require_perm('write:keys')
@@ -1563,9 +1827,11 @@ def format_dt(val):
     return val_str
 
 def add_servers_to_inventory(servers_data, default_group="web_servers"):
+    default_group_clean = sanitize_ansible_group_name(default_group)
+
     if not os.path.exists(INVENTORY_PATH):
         with open(INVENTORY_PATH, "w") as f:
-            f.write(f"[{default_group}]\n")
+            f.write(f"[{default_group_clean}]\n")
 
     with open(INVENTORY_PATH, "r") as f:
         content = f.read()
@@ -1581,9 +1847,16 @@ def add_servers_to_inventory(servers_data, default_group="web_servers"):
         if isinstance(item, dict):
             name = item.get("name", "").strip()
             ip = item.get("ip", "").strip()
-            group = item.get("group", "").strip() or default_group
+            group_raw = item.get("group", "").strip() or default_group
+            group = sanitize_ansible_group_name(group_raw)
+
             if not name or name in existing_names:
                 continue
+
+            is_valid_h, val_err = validate_inventory_host(name, ip)
+            if not is_valid_h:
+                raise ValueError(val_err)
+
             line_str = f"{name} ansible_host={ip}" if ip else name
         elif isinstance(item, str):
             line_clean = item.strip()
@@ -1593,8 +1866,18 @@ def add_servers_to_inventory(servers_data, default_group="web_servers"):
             name = parts[0]
             if name in existing_names:
                 continue
+
+            ip_val = None
+            for p in parts[1:]:
+                if p.startswith("ansible_host="):
+                    ip_val = p.split("=", 1)[1]
+
+            is_valid_h, val_err = validate_inventory_host(name, ip_val)
+            if not is_valid_h:
+                raise ValueError(val_err)
+
             line_str = line_clean
-            group = default_group
+            group = default_group_clean
         else:
             continue
 
@@ -1627,8 +1910,25 @@ def add_servers_to_inventory(servers_data, default_group="web_servers"):
         new_content_lines.append(f"\n[{grp}]")
         new_content_lines.extend(grp_lines)
 
-    with open(INVENTORY_PATH, "w") as f:
+    temp_inv_path = f"{INVENTORY_PATH}.tmp"
+    with open(temp_inv_path, "w") as f:
         f.write("\n".join(new_content_lines) + "\n")
+
+    is_valid, err_msg = validate_ansible_inventory_file(temp_inv_path)
+    if not is_valid:
+        if os.path.exists(temp_inv_path):
+            os.remove(temp_inv_path)
+        raise ValueError(f"Inventory validation failed: {err_msg}")
+
+    os.replace(temp_inv_path, INVENTORY_PATH)
+
+    try:
+        conn_log = get_db_connection()
+        cursor_log = conn_log.cursor()
+        cursor_log.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           ('INVENTORY_GEN', 'Admin', 'inventory.ini', 'system', 'SERVER_ADDED', 'None', ', '.join(new_added), f"Added {len(new_added)} server(s) ({', '.join(new_added)}) to Ansible inventory file"))
+        conn_log.close()
+    except Exception: pass
 
     return new_added
 
@@ -1676,7 +1976,10 @@ def add_servers():
     if not servers_to_add:
         return jsonify({"error": "No valid server data provided."}), 400
 
-    added_hosts = add_servers_to_inventory(servers_to_add, default_group=group)
+    try:
+        added_hosts = add_servers_to_inventory(servers_to_add, default_group=group)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
 
     if not added_hosts:
         return jsonify({"status": "warning", "message": "Server(s) already exist in inventory.ini or no new host was added.", "inventory": parse_inventory(INVENTORY_PATH)}), 200
@@ -1691,12 +1994,20 @@ def add_servers():
         "inventory": parse_inventory(INVENTORY_PATH)
     })
 
-def sync_inventory_to_server_metadata():
+def reconcile_database_with_inventory():
+    """Single Source of Truth Engine: Reconciles MySQL DB tables against inventory.ini.
+    1. Upserts current inventory hosts into server_metadata.
+    2. Purges orphan hosts from server_metadata, access_cache, ssh_key_cache, and active_temp_keys.
+    """
     try:
         inv = parse_inventory(INVENTORY_PATH)
+        all_hosts = inv.get("all_hosts", [])
+        active_hosts = [h["name"] for h in all_hosts]
+        
         conn = get_db_connection()
         cursor = conn.cursor()
-        for host_info in inv["all_hosts"]:
+
+        for host_info in all_hosts:
             name = host_info["name"]
             ip = host_info["ip"]
             grp = host_info["group"]
@@ -1707,9 +2018,25 @@ def sync_inventory_to_server_metadata():
                     ip = VALUES(ip),
                     group_name = VALUES(group_name)
             ''', (name, ip, grp))
+
+        if active_hosts:
+            format_strings = ','.join(['%s'] * len(active_hosts))
+            cursor.execute(f"DELETE FROM server_metadata WHERE host NOT IN ({format_strings})", tuple(active_hosts))
+            cursor.execute(f"DELETE FROM access_cache WHERE host NOT IN ({format_strings})", tuple(active_hosts))
+            cursor.execute(f"DELETE FROM ssh_key_cache WHERE host NOT IN ({format_strings})", tuple(active_hosts))
+            cursor.execute(f"DELETE FROM active_temp_keys WHERE host NOT IN ({format_strings})", tuple(active_hosts))
+        else:
+            cursor.execute("DELETE FROM server_metadata")
+            cursor.execute("DELETE FROM access_cache")
+            cursor.execute("DELETE FROM ssh_key_cache")
+            cursor.execute("DELETE FROM active_temp_keys")
+
         conn.close()
     except Exception as e:
-        print(f"Notice sync_inventory_to_server_metadata: {e}")
+        print(f"[!] Notice reconcile_database_with_inventory: {e}")
+
+def sync_inventory_to_server_metadata():
+    reconcile_database_with_inventory()
 
 @app.route('/api/servers/explorer', methods=['GET'])
 @require_perm('read:keys')
@@ -1853,11 +2180,26 @@ def remove_server():
     if not host:
         return jsonify({"error": "host parameter is required."}), 400
 
-    removed = remove_server_from_inventory(host)
-    if removed:
-        return jsonify({"status": "success", "message": f"Server '{host}' removed from inventory.ini.", "inventory": parse_inventory(INVENTORY_PATH)})
-    else:
-        return jsonify({"error": f"Server '{host}' not found in inventory.ini."}), 404
+    remove_server_from_inventory(host)
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM server_metadata WHERE host = %s", (host,))
+        cursor.execute("DELETE FROM access_cache WHERE host = %s", (host,))
+        cursor.execute("DELETE FROM ssh_key_cache WHERE host = %s", (host,))
+        cursor.execute("DELETE FROM active_temp_keys WHERE host = %s", (host,))
+        conn.close()
+    except Exception as e:
+        print(f"[!] Error purging removed host '{host}' from DB: {e}")
+
+    reconcile_database_with_inventory()
+
+    return jsonify({
+        "status": "success",
+        "message": f"Server '{host}' removed successfully from inventory and database.",
+        "inventory": parse_inventory(INVENTORY_PATH)
+    })
 
 @app.route('/api/jobs', methods=['GET'])
 def get_jobs():
@@ -1924,12 +2266,38 @@ def global_search():
     params = []
 
     if query:
-        q_clean = query
-        q_alt = query.replace(' ', '+')
-        q1 = f"%{q_clean}%"
-        q2 = f"%{q_alt}%"
-        where_clauses.append("(user LIKE %s OR host LIKE %s OR fingerprint LIKE %s OR algorithm LIKE %s OR comment LIKE %s OR raw_key LIKE %s OR key_body LIKE %s OR raw_key LIKE %s OR key_body LIKE %s)")
-        params.extend([q1, q1, q1, q1, q1, q1, q1, q2, q2])
+        computed_fp = compute_ssh_fingerprint(query) if (len(query) > 20 or 'ssh-' in query or 'SHA256:' in query) else ""
+        
+        parts = query.split()
+        key_body_token = ""
+        comment_token = ""
+        for p in parts:
+            if len(p) > 50 and not p.startswith('ssh-') and not p.startswith('mailto:'):
+                key_body_token = p
+            elif '@' in p or p.startswith('mailto:'):
+                comment_token = p
+
+        q1 = f"%{query}%"
+        sub_clauses = [
+            "user LIKE %s", "host LIKE %s", "fingerprint LIKE %s", 
+            "algorithm LIKE %s", "comment LIKE %s", "raw_key LIKE %s", "key_body LIKE %s"
+        ]
+        sub_params = [q1, q1, q1, q1, q1, q1, q1]
+
+        if computed_fp and computed_fp != "INVALID_KEY_FORMAT":
+            sub_clauses.append("fingerprint = %s")
+            sub_params.append(computed_fp)
+
+        if key_body_token:
+            sub_clauses.append("key_body LIKE %s")
+            sub_params.append(f"%{key_body_token}%")
+
+        if comment_token:
+            sub_clauses.append("comment LIKE %s")
+            sub_params.append(f"%{comment_token}%")
+
+        where_clauses.append("(" + " OR ".join(sub_clauses) + ")")
+        params.extend(sub_params)
 
     if host_filter and host_filter != 'all':
         where_clauses.append("host = %s")
@@ -2189,16 +2557,46 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
     JOB_STATUS[job_id] = "RUNNING"
     JOB_LOGS[job_id] = f"[{datetime.now().strftime('%H:%M:%S')}] Initiating background synchronization for {target_hosts_pattern}...\n"
     
-    pre_snapshot_users = {}
+    # Pre-Flight Inventory Validation Check
+    is_valid_inv, inv_err_msg = validate_ansible_inventory_file(INVENTORY_PATH)
+    if not is_valid_inv:
+        JOB_STATUS[job_id] = "FAILED"
+        fail_log = f"[{datetime.now().strftime('%H:%M:%S')}] [PRE-FLIGHT INVENTORY ERROR] Synchronization aborted due to invalid inventory syntax!\nReason: {inv_err_msg}\n"
+        JOB_LOGS[job_id] = fail_log
+        try:
+            conn_err = get_db_connection()
+            cursor_err = conn_err.cursor()
+            cursor_err.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                               (job_id, operator_name, 'inventory.ini', 'system', 'SYNC_FAILED', 'Valid Inventory', 'Invalid Inventory', f"Aborted background sync: {inv_err_msg}"))
+            cursor_err.execute("INSERT INTO job_history (id, status, action, target_user, target_hosts, logs, operator_name, key_comment) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                               (job_id, 'FAILED', 'SYNC_KEY_CACHE', 'all', target_hosts_pattern, fail_log, operator_name, f"Pre-flight failed: {inv_err_msg}"))
+            conn_err.close()
+        except Exception: pass
+        return
+
+    # Record SYNC_STARTED in audit log
+    try:
+        conn_init = get_db_connection()
+        cursor_init = conn_init.cursor()
+        cursor_init.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                           (job_id, operator_name, target_hosts_pattern, 'system', 'SYNC_STARTED', 'IDLE', 'RUNNING', f"Started background sync for target '{target_hosts_pattern}'"))
+        conn_init.close()
+    except Exception: pass
+
+    # Take Pre-Sync State Snapshot
+    pre_snapshot_keys = {}
     try:
         conn_pre = get_db_connection()
         cursor_pre = conn_pre.cursor()
-        cursor_pre.execute("SELECT host, user, fingerprint, comment FROM ssh_key_cache")
+        cursor_pre.execute("SELECT host, user, fingerprint, comment, raw_key FROM ssh_key_cache")
         for r in cursor_pre.fetchall():
             key_id = (r['host'], r['user'])
-            if key_id not in pre_snapshot_users:
-                pre_snapshot_users[key_id] = set()
-            pre_snapshot_users[key_id].add((r['fingerprint'], r['comment'] or ''))
+            if key_id not in pre_snapshot_keys:
+                pre_snapshot_keys[key_id] = {}
+            pre_snapshot_keys[key_id][r['fingerprint']] = {
+                'comment': r['comment'] or '',
+                'raw_key': r['raw_key'] or ''
+            }
         conn_pre.close()
     except Exception as pre_err:
         print(f"Notice pre-sync snapshot: {pre_err}")
@@ -2208,8 +2606,10 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
         output = res.stdout
         JOB_LOGS[job_id] = output
         
-        users_scanned = set()
-        keys_added = 0
+        # Parse Ansible output
+        scanned_hosts_map = {} # host -> dict(user -> parsed_keys_list)
+        users_scanned_set = set()
+        keys_count_total = 0
 
         for line in output.splitlines():
             line = line.strip().strip('"').strip("'")
@@ -2222,19 +2622,65 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
                 h = p_data.get('host', '').strip()
                 u = p_data.get('user', '').strip()
                 c = int(p_data.get('keys_count', 0)) if p_data.get('keys_count', '').isdigit() else 0
-                status = p_data.get('status', 'active' if c > 0 else 'none').strip()
                 keys_b64 = p_data.get('keys_b64', '').strip()
                 keys_text = safe_b64decode(keys_b64)
 
                 if h and u:
-                    users_scanned.add(u)
-                    update_access_cache(h, u, c, status=status, keys_text=keys_text)
+                    users_scanned_set.add((h, u))
+                    if h not in scanned_hosts_map:
+                        scanned_hosts_map[h] = {}
                     
-                    parsed = parse_authorized_keys_text(keys_text)
+                    parsed_keys = parse_authorized_keys_text(keys_text)
+                    scanned_hosts_map[h][u] = {
+                        "keys_text": keys_text,
+                        "keys_count": len(parsed_keys),
+                        "status": p_data.get('status', 'active' if len(parsed_keys) > 0 else 'none').strip(),
+                        "parsed_keys": parsed_keys
+                    }
+
+        # TRANSACTION-BASED DATABASE CONVERGENCE ENGINE
+        conn_conv = get_db_connection()
+        cursor_conv = conn_conv.cursor()
+        
+        try:
+            # For each host h that was scanned and responded
+            for h, user_data in scanned_hosts_map.items():
+                active_users_on_h = list(user_data.keys())
+
+                # A. Purge Obsolete Users on host h
+                if active_users_on_h:
+                    format_u = ','.join(['%s'] * len(active_users_on_h))
+                    cursor_conv.execute(f"DELETE FROM access_cache WHERE host = %s AND user NOT IN ({format_u})", [h] + active_users_on_h)
+                    cursor_conv.execute(f"DELETE FROM ssh_key_cache WHERE host = %s AND user NOT IN ({format_u})", [h] + active_users_on_h)
+                else:
+                    cursor_conv.execute("DELETE FROM access_cache WHERE host = %s", (h,))
+                    cursor_conv.execute("DELETE FROM ssh_key_cache WHERE host = %s", (h,))
+
+                # B. Converge Users and Keys on host h
+                for u, u_info in user_data.items():
+                    kt = u_info["keys_text"]
+                    kc = u_info["keys_count"]
+                    st = u_info["status"]
+                    parsed = u_info["parsed_keys"]
                     home_dir = "/root" if u == 'root' else f"/home/{u}"
-                    
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
+
+                    # Update access_cache
+                    cursor_conv.execute('''
+                        INSERT INTO access_cache (host, user, keys_count, has_access, status, keys_text, updated_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                        ON DUPLICATE KEY UPDATE
+                            keys_count = VALUES(keys_count),
+                            has_access = VALUES(has_access),
+                            status = VALUES(status),
+                            keys_text = VALUES(keys_text),
+                            updated_at = NOW()
+                    ''', (h, u, kc, 1 if st == 'active' else 0, st, kt))
+
+                    # Identify current DB key fingerprints for (h, u)
+                    cursor_conv.execute("SELECT fingerprint FROM ssh_key_cache WHERE host = %s AND user = %s", (h, u))
+                    existing_fps = set(r['fingerprint'] for r in cursor_conv.fetchall())
+
+                    scanned_fp_map = {}
                     for k in parsed:
                         rk = k.get('raw_key', '').strip()
                         if not rk: continue
@@ -2243,8 +2689,22 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
                         algo = k.get('algorithm') or (kparts[0] if kparts else 'ssh-rsa')
                         fp = k.get('fingerprint') or compute_ssh_fingerprint(rk)
                         cmt = k.get('comment') or (" ".join(kparts[2:]) if len(kparts) >= 3 else "")
+                        scanned_fp_map[fp] = {
+                            "algo": algo,
+                            "kbody": kbody,
+                            "rk": rk,
+                            "cmt": cmt
+                        }
 
-                        cursor.execute('''
+                    # Delete keys removed from authorized_keys
+                    removed_fps = existing_fps - set(scanned_fp_map.keys())
+                    if removed_fps:
+                        fmt_fps = ','.join(['%s'] * len(removed_fps))
+                        cursor_conv.execute(f"DELETE FROM ssh_key_cache WHERE host = %s AND user = %s AND fingerprint IN ({fmt_fps})", [h, u] + list(removed_fps))
+
+                    # Insert newly discovered / update active keys
+                    for fp, k_info in scanned_fp_map.items():
+                        cursor_conv.execute('''
                             INSERT INTO ssh_key_cache (host, user, home_dir, algorithm, key_body, raw_key, fingerprint, comment, status, last_synced_at)
                             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', NOW())
                             ON DUPLICATE KEY UPDATE
@@ -2254,24 +2714,28 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
                                 comment=VALUES(comment),
                                 status='active',
                                 last_synced_at=NOW()
-                        ''', (h, u, home_dir, algo, kbody, rk, fp, cmt))
-                        keys_added += 1
+                        ''', (h, u, home_dir, k_info["algo"], k_info["kbody"], k_info["rk"], fp, k_info["cmt"]))
+                        keys_count_total += 1
 
-                    conn.close()
+            # Recalculate duplicate key flags across DB
+            cursor_conv.execute('''
+                UPDATE ssh_key_cache s
+                SET is_duplicate = (
+                    SELECT IF(COUNT(DISTINCT CONCAT(k2.host, ':', k2.user)) > 1, 1, 0)
+                    FROM (SELECT host, user, fingerprint FROM ssh_key_cache) k2
+                    WHERE k2.fingerprint = s.fingerprint
+                )
+            ''')
 
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE ssh_key_cache s
-            SET is_duplicate = (
-                SELECT IF(COUNT(DISTINCT CONCAT(k2.host, ':', k2.user)) > 1, 1, 0)
-                FROM (SELECT host, user, fingerprint FROM ssh_key_cache) k2
-                WHERE k2.fingerprint = s.fingerprint
-            )
-        ''')
+            # Commit Transaction
+            conn_conv.commit()
+            conn_conv.close()
+        except Exception as conv_err:
+            conn_conv.rollback()
+            conn_conv.close()
+            raise conv_err
 
         exec_time = round(time.time() - start_t, 2)
-        
         log_file = os.path.join(LOGS_DIR, f"{job_id}.log")
         with open(log_file, "w") as f:
             f.write(output)
@@ -2282,7 +2746,10 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
 
         JOB_STATUS[job_id] = final_status
 
-        cursor.execute('''
+        conn_audit = get_db_connection()
+        cursor_audit = conn_audit.cursor()
+
+        cursor_audit.execute('''
             UPDATE sync_history SET
                 status = %s,
                 ended_at = NOW(),
@@ -2292,49 +2759,65 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
                 failures = %s,
                 execution_time_sec = %s
             WHERE job_id = %s
-        ''', (final_status, recap_info['total_hosts'], len(users_scanned), keys_added, recap_summary if final_status != 'SUCCESS' else '', exec_time, job_id))
+        ''', (final_status, recap_info['total_hosts'], len(users_scanned_set), keys_count_total, recap_summary if final_status != 'SUCCESS' else '', exec_time, job_id))
         
-        cursor.execute('''
+        cursor_audit.execute('''
             INSERT INTO job_history (id, status, action, target_user, target_hosts, logs, operator_name, key_comment)
             VALUES (%s, %s, 'SYNC_KEY_CACHE', 'all', %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE status=VALUES(status)
         ''', (job_id, final_status, target_hosts_pattern, output, operator_name, f"Sync {final_status}: {recap_summary}"))
 
-        # Post-Sync Change Tracking Diff Engine
+        # Post-Sync State Snapshot & Change Diff Log
         try:
-            post_snapshot_users = {}
-            cursor.execute("SELECT host, user, fingerprint, comment FROM ssh_key_cache")
-            for r in cursor.fetchall():
+            post_snapshot_keys = {}
+            cursor_audit.execute("SELECT host, user, fingerprint, comment, raw_key FROM ssh_key_cache")
+            for r in cursor_audit.fetchall():
                 key_id = (r['host'], r['user'])
-                if key_id not in post_snapshot_users:
-                    post_snapshot_users[key_id] = set()
-                post_snapshot_users[key_id].add((r['fingerprint'], r['comment'] or ''))
+                if key_id not in post_snapshot_keys:
+                    post_snapshot_keys[key_id] = {}
+                post_snapshot_keys[key_id][r['fingerprint']] = {
+                    'comment': r['comment'] or '',
+                    'raw_key': r['raw_key'] or ''
+                }
 
-            # Detect New Users
-            for (h, u) in post_snapshot_users.keys():
-                if (h, u) not in pre_snapshot_users:
-                    cursor.execute('''
+            # Detect New Linux Users on scanned hosts
+            for (h, u) in post_snapshot_keys.keys():
+                if h in scanned_hosts_map and (h, u) not in pre_snapshot_keys:
+                    cursor_audit.execute('''
                         INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
-                        VALUES (%s, %s, %s, %s, 'NEW_USER', 'None', %s, %s)
+                        VALUES (%s, %s, %s, %s, 'NEW_LINUX_USER', 'None', %s, %s)
                     ''', (job_id, operator_name, h, u, f"User {u}", f"Discovered new Linux user account '{u}' on server '{h}'"))
 
-            # Detect Removed Users
-            for (h, u) in pre_snapshot_users.keys():
-                if (h, u) not in post_snapshot_users:
-                    cursor.execute('''
+            # Detect Removed Linux Users on scanned hosts
+            for (h, u) in pre_snapshot_keys.keys():
+                if h in scanned_hosts_map and (h, u) not in post_snapshot_keys:
+                    cursor_audit.execute('''
                         INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
-                        VALUES (%s, %s, %s, %s, 'USER_REMOVED', %s, 'None', %s)
+                        VALUES (%s, %s, %s, %s, 'REMOVED_LINUX_USER', %s, 'None', %s)
                     ''', (job_id, operator_name, h, u, f"User {u}", f"User account '{u}' removed from server '{h}'"))
 
-            # Detect Key Additions
-            for (h, u), post_keys in post_snapshot_users.items():
-                pre_keys = pre_snapshot_users.get((h, u), set())
-                added_keys = post_keys - pre_keys
-                for fp, cmt in added_keys:
-                    cursor.execute('''
+            # Detect Key Additions & Key Removals on scanned hosts
+            for (h, u) in set(list(pre_snapshot_keys.keys()) + list(post_snapshot_keys.keys())):
+                if h not in scanned_hosts_map:
+                    continue
+                pre_fps = pre_snapshot_keys.get((h, u), {})
+                post_fps = post_snapshot_keys.get((h, u), {})
+
+                # Added Keys
+                for fp in set(post_fps.keys()) - set(pre_fps.keys()):
+                    cmt = post_fps[fp]['comment'] or fp
+                    cursor_audit.execute('''
                         INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
-                        VALUES (%s, %s, %s, %s, 'KEY_ADDED', 'None', %s, %s)
-                    ''', (job_id, operator_name, h, u, f"Key ({cmt or fp})", f"Authorized new SSH key ('{cmt or fp}') for user '{u}' on '{h}'"))
+                        VALUES (%s, %s, %s, %s, 'NEW_SSH_KEY', 'None', %s, %s)
+                    ''', (job_id, operator_name, h, u, f"Key ({cmt})", f"Authorized new SSH key ('{cmt}') for user '{u}' on '{h}'"))
+
+                # Removed Keys
+                for fp in set(pre_fps.keys()) - set(post_fps.keys()):
+                    cmt = pre_fps[fp]['comment'] or fp
+                    cursor_audit.execute('''
+                        INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
+                        VALUES (%s, %s, %s, %s, 'REMOVED_SSH_KEY', %s, 'None', %s)
+                    ''', (job_id, operator_name, h, u, f"Key ({cmt})", f"Removed SSH key ('{cmt}') from user '{u}' on server '{h}'"))
 
             # Detect Unreachable Hosts
             if 'UNREACHABLE' in recap_summary:
@@ -2342,25 +2825,32 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
                     if 'UNREACHABLE!' in line:
                         parts = line.split(']')
                         unreach_h = parts[0].split('[')[-1].strip() if len(parts) >= 2 else 'Unknown'
-                        cursor.execute('''
+                        cursor_audit.execute('''
                             INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
-                            VALUES (%s, %s, %s, 'system', 'SERVER_UNREACHABLE', 'ONLINE', 'UNREACHABLE', %s)
+                            VALUES (%s, %s, %s, 'system', 'SYNC_FAILED', 'ONLINE', 'UNREACHABLE', %s)
                         ''', (job_id, operator_name, unreach_h, f"Server '{unreach_h}' unreachable during SSH connection check"))
+
+            # Log SYNC_COMPLETED
+            cursor_audit.execute('''
+                INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description)
+                VALUES (%s, %s, %s, 'system', 'SYNC_COMPLETED', 'RUNNING', %s, %s)
+            ''', (job_id, operator_name, target_hosts_pattern, final_status, f"Sync job completed with status '{final_status}' in {exec_time}s"))
 
         except Exception as diff_err:
             print(f"Notice generating sync change diffs: {diff_err}")
 
-        conn.close()
+        conn_audit.close()
 
     except Exception as e:
-        exec_time = round(time.time() - start_t, 2)
-        err_msg = str(e)
-        JOB_LOGS[job_id] = f"Error during sync: {err_msg}"
         JOB_STATUS[job_id] = "FAILED"
+        err_msg = str(e)
+        exec_time = round(time.time() - start_t, 2)
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute('''
+            conn_f = get_db_connection()
+            cursor_f = conn_f.cursor()
+            cursor_f.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                               (job_id, operator_name, target_hosts_pattern, 'system', 'SYNC_FAILED', 'RUNNING', 'FAILED', f"Synchronization failed: {err_msg}"))
+            cursor_f.execute('''
                 UPDATE sync_history SET
                     status = 'FAILED',
                     ended_at = NOW(),
@@ -2368,9 +2858,8 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
                     execution_time_sec = %s
                 WHERE job_id = %s
             ''', (err_msg, exec_time, job_id))
-            conn.close()
-        except Exception:
-            pass
+            conn_f.close()
+        except Exception: pass
 
 @app.route('/api/keys/audit', methods=['POST'])
 def audit_keys():
@@ -2426,68 +2915,10 @@ def inspect_user_keys():
     data = request.json or {}
     host = data.get('host', '').strip()
     user = data.get('user', '').strip()
-    live = data.get('live', False)
 
     if not user:
         return jsonify({"error": "user parameter is required."}), 400
 
-    target_pattern = host if (host and host != 'all') else 'all'
-
-    if live:
-        cmd = [
-            ANSIBLE_BIN,
-            "-i", INVENTORY_PATH,
-            FETCH_PLAYBOOK,
-            "--extra-vars", json.dumps({"target_user": user, "target_hosts": target_pattern})
-        ]
-        if target_pattern != 'all':
-            cmd.extend(["--limit", target_pattern])
-
-        try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=BASE_DIR, env=get_env(), timeout=30)
-            host_map = {}
-            for line in res.stdout.splitlines():
-                line = line.strip().strip('"').strip("'")
-                if 'SSHKEYAUDIT|' in line:
-                    idx = line.index('SSHKEYAUDIT|')
-                    audit_line = line[idx:]
-                    parts = audit_line.split('|')
-                    p_data = {}
-                    for p in parts[1:]:
-                        if '=' in p:
-                            k, v = p.split('=', 1)
-                            p_data[k.strip()] = v.strip()
-                    h = p_data.get('host', '').strip()
-                    u = p_data.get('user', '').strip()
-                    try:
-                        c = int(p_data.get('keys_count', 0))
-                    except ValueError:
-                        c = 0
-                    status = p_data.get('status', 'active' if c > 0 else 'none').strip()
-                    keys_b64 = p_data.get('keys_b64', '').strip()
-                    keys_text = safe_b64decode(keys_b64)
-
-                    parsed_keys = parse_authorized_keys_text(keys_text)
-                    final_count = len(parsed_keys) if parsed_keys else c
-
-                    if h and u:
-                        update_access_cache(h, u, final_count, status=status, keys_text=keys_text)
-                        host_map[h] = {
-                            "host": h,
-                            "user": u,
-                            "status": status,
-                            "keys_count": final_count,
-                            "keys_list": parsed_keys,
-                            "keys_text": keys_text
-                        }
-
-            results = list(host_map.values())
-            if results:
-                return jsonify({"user": user, "inspect_results": results, "source": "live"})
-        except Exception as e:
-            print(f"[!] Error performing live inspect for user '{user}': {e}")
-
-    # Fallback to DB cache if live scan unavailable
     conn = get_db_connection()
     cursor = conn.cursor()
     if host and host != 'all':
@@ -2523,7 +2954,7 @@ def inspect_user_keys():
             if 'keys_text' in r and r['keys_text']:
                 r['keys_text'] = "\n".join([mask_ssh_key(line) for line in r['keys_text'].splitlines() if line.strip()])
 
-    return jsonify({"user": user, "inspect_results": results, "source": "cache" if not live else "live", "can_copy_full": can_view_full})
+    return jsonify({"user": user, "inspect_results": results, "source": "cache", "can_copy_full": can_view_full})
 
 @app.route('/api/sync/changes', methods=['GET'])
 @require_perm('read:keys')

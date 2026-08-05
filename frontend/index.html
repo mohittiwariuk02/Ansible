@@ -24,7 +24,7 @@
         <form id="form-login">
             <div class="form-group" style="margin-bottom:16px;">
                 <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;color:var(--text-main);">Username</label>
-                <input type="text" id="login-username" class="form-control" placeholder="e.g. admin or developer" required autocomplete="username" style="width:100%;padding:10px 14px;">
+                <input type="text" id="login-username" class="form-control" placeholder="Enter your username" required autocomplete="username" style="width:100%;padding:10px 14px;">
             </div>
             <div class="form-group" style="margin-bottom:20px;">
                 <label style="font-weight:600;font-size:12px;display:block;margin-bottom:6px;color:var(--text-main);">Password</label>
@@ -34,11 +34,6 @@
             <button type="submit" class="btn btn-primary" id="btn-submit-login" style="width:100%;padding:12px;font-size:14px;font-weight:700;justify-content:center;">
                 <i class="fa-solid fa-right-to-bracket"></i> Log In to Dashboard
             </button>
-            <div style="margin-top:20px;padding:12px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:8px;font-size:11px;color:var(--text-muted);line-height:1.5;">
-                <strong style="color:var(--text-main);">Default Accounts:</strong><br>
-                • <strong>Administrator</strong>: <code>admin</code> / <code>admin123</code> (Full Write & Unmasked)<br>
-                • <strong>Developer</strong>: <code>developer</code> / <code>dev123</code> (Read-Only & Masked Keys)
-            </div>
         </form>
     </div>
 </div>
@@ -92,6 +87,10 @@
             <button class="nav-item" data-tab="tab-history">
                 <i class="fa-solid fa-clock-rotate-left"></i>
                 <span>Audit Log</span>
+            </button>
+            <button class="nav-item" data-tab="tab-user-management" id="nav-user-management" style="display:none;">
+                <i class="fa-solid fa-user-shield"></i>
+                <span>User Management</span>
             </button>
         </nav>
 
@@ -1026,7 +1025,149 @@
             </div>
         </section>
 
+        <!-- ===== TAB: User Management ===== -->
+        <section class="tab-content" id="tab-user-management">
+            <div class="card glass-card">
+                <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <h3 style="margin:0;"><i class="fa-solid fa-user-shield" style="color:var(--primary);"></i> Enterprise User & Access Management</h3>
+                        <p style="font-size:12px;color:var(--text-dim);margin:2px 0 0 0;">Manage dashboard users, role assignments, passwords, and account status</p>
+                    </div>
+                    <button class="btn btn-primary btn-sm" id="btn-open-create-user-modal">
+                        <i class="fa-solid fa-user-plus"></i> Create App User
+                    </button>
+                </div>
+                <div class="card-body" style="padding:24px;">
+
+                    <!-- Filter Control Bar -->
+                    <div style="display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;align-items:center;background:rgba(255,255,255,0.02);padding:14px;border-radius:var(--radius-sm);border:1px solid var(--border-color);">
+                        <input type="text" id="user-mgmt-search" placeholder="Search by username, full name, or email..." style="font-size:12px;padding:8px 12px;min-width:240px;flex:1;">
+                        <select id="user-mgmt-role-filter" class="custom-select" style="font-size:12px;padding:8px 12px;background:var(--bg-glass-input);min-width:160px;">
+                            <option value="all">All Roles</option>
+                            <option value="admin">Administrator</option>
+                            <option value="developer">Developer</option>
+                        </select>
+                        <select id="user-mgmt-status-filter" class="custom-select" style="font-size:12px;padding:8px 12px;background:var(--bg-glass-input);min-width:140px;">
+                            <option value="all">All Statuses</option>
+                            <option value="active">Active</option>
+                            <option value="disabled">Disabled</option>
+                        </select>
+                        <button class="btn btn-outline btn-sm" id="btn-refresh-user-mgmt"><i class="fa-solid fa-rotate"></i> Refresh Users</button>
+                    </div>
+
+                    <!-- Users Table -->
+                    <div class="table-responsive">
+                        <table class="custom-table" style="font-size:12.5px;">
+                            <thead>
+                                <tr>
+                                    <th>Username</th>
+                                    <th>Full Name & Email</th>
+                                    <th>Role</th>
+                                    <th>Status</th>
+                                    <th>Last Login</th>
+                                    <th>Created Date</th>
+                                    <th style="text-align:right;">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="user-mgmt-table-body">
+                                <tr><td colspan="7" class="text-center" style="padding:16px;color:var(--text-muted);">Loading dashboard users...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                </div>
+            </div>
+        </section>
+
     </main>
+</div>
+
+<!-- Create / Edit User Modal -->
+<div class="modal-backdrop" id="modal-user-form">
+    <div class="modal-card" style="max-width:500px;width:95%;">
+        <div class="modal-header">
+            <div>
+                <h3 id="user-form-modal-title"><i class="fa-solid fa-user-plus"></i> Create Dashboard User</h3>
+                <p style="font-size:12px;color:var(--text-dim);margin-top:2px;">Set user account credentials and role authorization</p>
+            </div>
+            <button class="modal-close" id="btn-close-user-form">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form id="user-mgmt-form">
+                <input type="hidden" id="user-form-id" value="">
+                
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="font-size:12px;font-weight:700;">Username</label>
+                    <input type="text" id="user-form-username" required placeholder="e.g. dev_user1" style="font-size:12px;padding:8px 12px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom:12px;" id="user-form-pwd-group">
+                    <label style="font-size:12px;font-weight:700;">Password</label>
+                    <input type="password" id="user-form-password" required placeholder="Enter secure password" style="font-size:12px;padding:8px 12px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="font-size:12px;font-weight:700;">Full Name</label>
+                    <input type="text" id="user-form-fullname" placeholder="e.g. Mohit Tiwari" style="font-size:12px;padding:8px 12px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="font-size:12px;font-weight:700;">Email Address (Optional)</label>
+                    <input type="email" id="user-form-email" placeholder="e.g. mohit@example.com" style="font-size:12px;padding:8px 12px;">
+                </div>
+
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label style="font-size:12px;font-weight:700;">Application Role</label>
+                    <select id="user-form-role" class="custom-select" required style="background:var(--bg-glass-input);"></select>
+                </div>
+
+                <div class="form-group" style="margin-bottom:18px;">
+                    <label style="font-size:12px;font-weight:700;">Account Status</label>
+                    <select id="user-form-status" class="custom-select" style="background:var(--bg-glass-input);">
+                        <option value="1">Active</option>
+                        <option value="0">Disabled</option>
+                    </select>
+                </div>
+
+                <div style="display:flex;justify-content:flex-end;gap:10px;">
+                    <button type="button" class="btn btn-outline" id="btn-cancel-user-form">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="btn-submit-user-form">
+                        <i class="fa-solid fa-floppy-disk"></i> Save User
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Reset Password Modal -->
+<div class="modal-backdrop" id="modal-reset-user-pwd">
+    <div class="modal-card" style="max-width:450px;width:95%;">
+        <div class="modal-header">
+            <div>
+                <h3><i class="fa-solid fa-key"></i> Reset User Password</h3>
+                <p style="font-size:12px;color:var(--text-dim);margin-top:2px;">Update password for user <strong id="reset-pwd-username-label">--</strong></p>
+            </div>
+            <button class="modal-close" id="btn-close-reset-pwd">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form id="user-reset-pwd-form">
+                <input type="hidden" id="reset-pwd-user-id" value="">
+                
+                <div class="form-group" style="margin-bottom:16px;">
+                    <label style="font-size:12px;font-weight:700;">New Password</label>
+                    <input type="password" id="reset-pwd-new-password" required placeholder="Enter new secure password" style="font-size:12px;padding:8px 12px;">
+                </div>
+
+                <div style="display:flex;justify-content:flex-end;gap:10px;">
+                    <button type="button" class="btn btn-outline" id="btn-cancel-reset-pwd">Cancel</button>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fa-solid fa-check"></i> Reset Password
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
 </div>
 
 <!-- Log Modal -->

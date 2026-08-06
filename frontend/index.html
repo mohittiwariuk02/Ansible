@@ -72,10 +72,7 @@
                 <i class="fa-solid fa-server"></i>
                 <span>Managed Servers</span>
             </button>
-            <button class="nav-item" data-tab="tab-auditor">
-                <i class="fa-solid fa-shield-halved"></i>
-                <span>Key Auditor</span>
-            </button>
+
             <button class="nav-item" data-tab="tab-sharing">
                 <i class="fa-solid fa-share-nodes"></i>
                 <span>Key Sharing</span>
@@ -263,6 +260,29 @@
                         <div style="display:flex;gap:8px;">
                             <button class="btn btn-outline btn-xs" id="btn-global-prev-page" disabled><i class="fa-solid fa-chevron-left"></i> Previous</button>
                             <button class="btn btn-outline btn-xs" id="btn-global-next-page" disabled>Next <i class="fa-solid fa-chevron-right"></i></button>
+                        </div>
+                    </div>
+
+                    <!-- Enterprise Infrastructure Duplicate Key Analysis -->
+                    <div style="margin-top:30px;background:rgba(255,255,255,0.02);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:20px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:12px;">
+                            <div>
+                                <h4 style="font-size:15px;font-weight:700;margin:0;color:var(--text-main);">
+                                    <i class="fa-solid fa-copy" style="color:var(--warning);"></i> Infrastructure Duplicate Key Intelligence & Analysis
+                                </h4>
+                                <p style="font-size:12px;color:var(--text-dim);margin:2px 0 0 0;">Scans database cache to report duplicate SSH keys, host breakdown, and user scope across all managed servers</p>
+                            </div>
+                            <button class="btn btn-warning btn-sm" id="btn-run-duplicate-analysis">
+                                <i class="fa-solid fa-magnifying-glass-chart"></i> Analyze Infrastructure Duplicates
+                            </button>
+                        </div>
+
+                        <div style="display:flex;gap:10px;margin-bottom:16px;">
+                            <input type="text" id="dup-search-input" placeholder="Paste SSH public key, fingerprint, or comment to analyze (or leave empty for all duplicates)..." style="font-size:12px;padding:8px 12px;width:100%;">
+                        </div>
+
+                        <div id="duplicate-analysis-container">
+                            <p class="empty-state">Click "Analyze Infrastructure Duplicates" to generate a detailed duplicate breakdown.</p>
                         </div>
                     </div>
                 </div>
@@ -639,52 +659,7 @@
             </div>
         </div>
 
-        <!-- ===== TAB 4: Key Auditor ===== -->
-        <section class="tab-content" id="tab-auditor">
-            <div class="card glass-card">
-                <div class="card-header">
-                    <h3><i class="fa-solid fa-shield-check"></i> Remote Authorized Keys Auditor</h3>
-                    <span class="badge badge-info">Live Inspection</span>
-                </div>
-                <div class="card-body">
-                    <div class="audit-control-bar">
-                        <div class="inline-group">
-                            <label for="audit-username" style="font-weight:700;font-size:13px;white-space:nowrap;">Audit User:</label>
-                            <input type="text" id="audit-username" value="ajay" placeholder="e.g. ajay" style="max-width:200px;">
-                            <button class="btn btn-primary" id="btn-run-audit">
-                                <i class="fa-solid fa-magnifying-glass"></i> Scan Authorized Keys
-                            </button>
-                        </div>
-                    </div>
-                    <div class="audit-results-container" id="audit-results-container">
-                        <p class="empty-state">Click "Scan Authorized Keys" to inspect SSH keys on all managed servers.</p>
-                    </div>
 
-                    <!-- Enterprise Infrastructure Duplicate Key Analysis -->
-                    <div style="margin-top:30px;background:rgba(255,255,255,0.02);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:20px;">
-                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:12px;">
-                            <div>
-                                <h4 style="font-size:15px;font-weight:700;margin:0;color:var(--text-main);">
-                                    <i class="fa-solid fa-copy" style="color:var(--warning);"></i> Infrastructure Duplicate Key Intelligence & Analysis
-                                </h4>
-                                <p style="font-size:12px;color:var(--text-dim);margin:2px 0 0 0;">Scans database cache to report duplicate SSH keys, host breakdown, and user scope across all managed servers</p>
-                            </div>
-                            <button class="btn btn-warning btn-sm" id="btn-run-duplicate-analysis">
-                                <i class="fa-solid fa-magnifying-glass-chart"></i> Analyze Infrastructure Duplicates
-                            </button>
-                        </div>
-
-                        <div style="display:flex;gap:10px;margin-bottom:16px;">
-                            <input type="text" id="dup-search-input" placeholder="Paste SSH public key, fingerprint, or comment to analyze (or leave empty for all duplicates)..." style="font-size:12px;padding:8px 12px;width:100%;">
-                        </div>
-
-                        <div id="duplicate-analysis-container">
-                            <p class="empty-state">Click "Analyze Infrastructure Duplicates" to generate a detailed duplicate breakdown.</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </section>
 
         <!-- ===== TAB: Key Sharing Engine (5-Step Wizard) ===== -->
         <section class="tab-content" id="tab-sharing">

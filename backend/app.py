@@ -277,9 +277,9 @@ def init_db():
         for pid in range(1, 7):
             cursor.execute("INSERT IGNORE INTO role_permissions (role_id, perm_id) VALUES (1, %s)", (pid,))
 
-        # Assign Read-Only & Sync Permissions to Developer Role (2)
+        # Assign Only Read-Only Permission (1) to Developer Role (2) - Restricted from SSH Sync
         cursor.execute("INSERT IGNORE INTO role_permissions (role_id, perm_id) VALUES (2, 1)")
-        cursor.execute("INSERT IGNORE INTO role_permissions (role_id, perm_id) VALUES (2, 6)")
+        cursor.execute("DELETE FROM role_permissions WHERE role_id = 2 AND perm_id = 6")
 
         # Seed Default Admin User ('admin' / 'admin123')
         admin_hash = generate_password_hash('admin123')
@@ -2950,51 +2950,31 @@ def run_sync_job_background(job_id, cmd, sync_mode, target_hosts_pattern, operat
 @app.route('/api/keys/audit', methods=['POST'])
 def audit_keys():
     data = request.json or {}
-    target_user = data.get('target_user', 'developer').strip()
+    target_user = data.get('target_user', '').strip()
     target_hosts = data.get('target_hosts', ['all'])
-    target_hosts_pattern = ",".join(target_hosts) if isinstance(target_hosts, list) else target_hosts
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    cmd = [
-        ANSIBLE_BIN,
-        "-i", INVENTORY_PATH,
-        FETCH_PLAYBOOK,
-        "--extra-vars", json.dumps({"target_user": target_user, "target_hosts": target_hosts_pattern})
-    ]
+    if target_user and target_user != 'all':
+        cursor.execute("SELECT host, user, keys_count, status, keys_text FROM access_cache WHERE user = %s AND status IN ('active', 'disabled')", (target_user,))
+    else:
+        cursor.execute("SELECT host, user, keys_count, status, keys_text FROM access_cache WHERE status IN ('active', 'disabled')")
+    
+    rows = cursor.fetchall()
+    conn.close()
 
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=BASE_DIR, env=get_env(), timeout=120)
-        output = res.stdout
-        host_map = {}
-        for line in output.splitlines():
-            line = line.strip().strip('"').strip("'")
-            if 'SSHKEYAUDIT|' in line:
-                idx = line.index('SSHKEYAUDIT|')
-                audit_line = line[idx:]
-                parts = audit_line.split('|')
-                p_data = {}
-                for p in parts[1:]:
-                    if '=' in p:
-                        k, v = p.split('=', 1)
-                        p_data[k.strip()] = v.strip()
-                h = p_data.get('host', '').strip()
-                u = p_data.get('user', '').strip()
-                try:
-                    c = int(p_data.get('keys_count', 0))
-                except ValueError:
-                    c = 0
-                status = p_data.get('status', 'active' if c > 0 else 'none').strip()
-                keys_b64 = p_data.get('keys_b64', '').strip()
-                keys_text = safe_b64decode(keys_b64)
+    results = []
+    for r in rows:
+        results.append({
+            "host": r["host"],
+            "user": r["user"],
+            "keys_count": r["keys_count"],
+            "status": r["status"],
+            "keys_text": r["keys_text"] or ""
+        })
 
-                if h and u:
-                    host_map[h] = {"host": h, "user": u, "keys_count": c, "status": status, "keys_text": keys_text}
-                    update_access_cache(h, u, c, status=status, keys_text=keys_text)
-        audit_results = list(host_map.values())
-        return jsonify({"target_user": target_user, "results": audit_results, "raw_output": output})
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Audit timed out after 120s."}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return jsonify({"target_user": target_user or "all", "results": results, "source": "database"})
 
 @app.route('/api/keys/inspect', methods=['POST'])
 def inspect_user_keys():

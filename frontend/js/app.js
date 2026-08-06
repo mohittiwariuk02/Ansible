@@ -32,9 +32,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const inventoryTableBody = document.getElementById('inventory-table-body');
     const inventoryCount     = document.getElementById('inventory-count');
 
-    const auditUsername      = document.getElementById('audit-username');
-    const btnRunAudit        = document.getElementById('btn-run-audit');
-    const auditResultsContainer = document.getElementById('audit-results-container');
+
 
     const historyTableBody   = document.getElementById('history-table-body');
     const btnRefreshHistory  = document.getElementById('btn-refresh-history');
@@ -168,7 +166,6 @@ document.addEventListener('DOMContentLoaded', () => {
         'tab-user-directory': { title: 'Discovered User Access Directory', subtitle: 'View all system users and delegate server access across your Linux infrastructure.' },
         'tab-matrix':    { title: 'Server Access Matrix', subtitle: 'Real-time server-by-server view of active SSH authorized keys.' },
         'tab-inventory': { title: 'Managed Infrastructure Inventory', subtitle: 'List of target managed servers, inventory groups, and connection status.' },
-        'tab-auditor':   { title: 'Authorized Keys Auditor', subtitle: 'Scan and audit existing SSH keys directly from remote servers.' },
         'tab-sharing':   { title: 'Key Sharing Engine', subtitle: 'Securely share existing SSH public keys between managed servers and user accounts.' },
         'tab-sync-engine': { title: 'SSH Key Synchronization Engine', subtitle: 'Asynchronous background synchronization between managed Linux servers and local SQLite cache.' },
         'tab-history':   { title: 'Operator Audit Log & History', subtitle: 'Full accountability trail of who added, disabled, or revoked access.' },
@@ -1159,43 +1156,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    /* ============================================================
-       KEY AUDITOR
-    ============================================================ */
-    btnRunAudit.addEventListener('click', () => {
-        const username = auditUsername.value.trim();
-        if (!username) return alert('Enter username to audit.');
-        auditResultsContainer.innerHTML = '<div class="loading-spinner"><i class="fa-solid fa-circle-notch fa-spin"></i> Querying remote servers via Ansible...</div>';
 
-        fetch('/api/keys/audit', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ target_user: username, target_hosts: ['all'] })
-        })
-        .then(r => r.json())
-        .then(data => {
-            if (data.results && data.results.length > 0) {
-                let html = `<div class="table-responsive"><table class="custom-table"><thead><tr>
-                    <th>Server</th><th>User</th><th>Active Keys</th><th>Status</th>
-                </tr></thead><tbody>`;
-                data.results.forEach(r => {
-                    html += `<tr>
-                        <td><strong>${r.host}</strong></td>
-                        <td><code>${r.user}</code></td>
-                        <td><span class="badge ${r.keys_count > 0 ? 'badge-success' : 'badge-warning'}">${r.keys_count} key${r.keys_count !== 1 ? 's' : ''}</span></td>
-                        <td><span class="badge badge-info">Scanned</span></td>
-                    </tr>`;
-                });
-                html += '</tbody></table></div>';
-                auditResultsContainer.innerHTML = html;
-            } else {
-                auditResultsContainer.innerHTML = `<pre class="terminal-output" style="max-height:250px;">${data.raw_output || 'No audit data returned.'}</pre>`;
-            }
-        })
-        .catch(err => {
-            auditResultsContainer.innerHTML = `<div class="error-msg">Audit failed: ${err.message}</div>`;
-        });
-    });
 
     /* ============================================================
        JOB HISTORY

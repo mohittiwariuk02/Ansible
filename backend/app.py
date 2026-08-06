@@ -560,6 +560,7 @@ def parse_inventory(path):
                 host_info = {
                     "name": hostname,
                     "ip":   host_vars.get("ansible_host", hostname),
+                    "ssh_user": host_vars.get("ansible_user", "ansible"),
                     "group": group_base
                 }
 
@@ -693,11 +694,7 @@ def update_access_cache(host, user, keys_count, status='active', keys_text=''):
                     updated_at=NOW()
             ''', (host, user, keys_count, has_access, status, keys_text))
         else:
-            cursor.execute('''
-                UPDATE access_cache
-                SET keys_count=0, has_access=0, status='none', keys_text='', updated_at=NOW()
-                WHERE host=%s AND user=%s
-            ''', (host, user))
+            cursor.execute("DELETE FROM access_cache WHERE host=%s AND user=%s", (host, user))
 
         conn.close()
     except Exception as e:
@@ -879,7 +876,7 @@ def check_temp_key_expirations():
                 extra_vars = {
                     "target_user": user,
                     "ssh_key": ssh_key,
-                    "key_state": "absent" if ssh_key else "purge_all",
+                    "key_state": "absent",
                     "key_comment": "Auto-Expired Key Revocation",
                     "target_hosts": host
                 }
@@ -1318,14 +1315,9 @@ def deploy_key():
         action_label = "ADD_KEY"
     elif action == "remove":
         if not ssh_key:
-            key_state = "purge_all"
-            action_label = "PURGE_USER_ACCESS"
-        else:
-            key_state = "absent"
-            action_label = "REVOKE_KEY"
-    elif action == "purge":
-        key_state = "purge_all"
-        action_label = "PURGE_USER_ACCESS"
+            return jsonify({"error": "SSH Public Key is required for removing access."}), 400
+        key_state = "absent"
+        action_label = "REVOKE_KEY"
     elif action == "disable":
         key_state = "disable"
         action_label = "DISABLE_ACCESS"
@@ -1333,7 +1325,7 @@ def deploy_key():
         key_state = "enable"
         action_label = "ENABLE_ACCESS"
     else:
-        return jsonify({"error": "Invalid action. Must be 'add', 'remove', 'purge', 'disable', or 'enable'."}), 400
+        return jsonify({"error": "Invalid action. Must be 'add', 'remove', 'disable', or 'enable'."}), 400
 
     job_id = str(uuid.uuid4())[:8]
     target_hosts_pattern = ",".join(target_hosts) if isinstance(target_hosts, list) else target_hosts
@@ -1390,7 +1382,7 @@ def get_access_matrix():
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    cursor.execute("SELECT host, user, keys_count, has_access, status, keys_text, updated_at FROM access_cache")
+    cursor.execute("SELECT host, user, keys_count, has_access, status, keys_text, updated_at FROM access_cache WHERE status IN ('active', 'disabled') OR keys_count > 0")
     rows = cursor.fetchall()
 
     cursor.execute("SELECT MAX(updated_at) as max_scan FROM access_cache")
@@ -1994,6 +1986,98 @@ def add_servers():
         "inventory": parse_inventory(INVENTORY_PATH)
     })
 
+def update_server_in_inventory(old_host, new_host, new_ip, new_group):
+    if not os.path.exists(INVENTORY_PATH):
+        raise ValueError("inventory.ini file not found")
+    
+    sanitized_group = sanitize_ansible_group_name(new_group)
+    
+    with open(INVENTORY_PATH, "r") as f:
+        lines = f.readlines()
+
+    clean_lines = []
+    for line in lines:
+        parts = line.strip().split()
+        if parts and parts[0] == old_host:
+            continue
+        clean_lines.append(line)
+
+    group_header = f"[{sanitized_group}]"
+    header_idx = -1
+    for idx, line in enumerate(clean_lines):
+        if line.strip() == group_header:
+            header_idx = idx
+            break
+
+    entry_line = f"{new_host} ansible_host={new_ip}\n"
+    if header_idx != -1:
+        clean_lines.insert(header_idx + 1, entry_line)
+    else:
+        if clean_lines and not clean_lines[-1].endswith("\n"):
+            clean_lines.append("\n")
+        clean_lines.append(f"\n{group_header}\n{entry_line}")
+
+    with open(INVENTORY_PATH, "w") as f:
+        f.writelines(clean_lines)
+
+    valid, err_msg = validate_ansible_inventory_file(INVENTORY_PATH)
+    if not valid:
+        with open(INVENTORY_PATH, "w") as f:
+            f.writelines(lines)
+        raise ValueError(f"Inventory validation failed: {err_msg}")
+
+    return True
+
+@app.route('/api/servers/update', methods=['POST'])
+@require_perm('manage:servers')
+def update_server():
+    data = request.json or {}
+    old_host = data.get('old_host', '').strip()
+    new_host = data.get('new_host', '').strip()
+    new_ip = data.get('new_ip', '').strip()
+    new_group = data.get('new_group', 'web_servers').strip() or 'web_servers'
+
+    if not old_host or not new_host or not new_ip:
+        return jsonify({"error": "Original Hostname, New Hostname, and IP Address are required."}), 400
+
+    inv = parse_inventory(INVENTORY_PATH)
+    all_hosts = inv.get("all_hosts", [])
+    all_host_names = [h["name"] for h in all_hosts]
+
+    if old_host != new_host and new_host in all_host_names:
+        return jsonify({"error": f"Target server hostname '{new_host}' already exists in inventory."}), 400
+
+    if old_host not in all_host_names:
+        return jsonify({"error": f"Server '{old_host}' not found in inventory."}), 404
+
+    try:
+        update_server_in_inventory(old_host, new_host, new_ip, new_group)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    if old_host != new_host:
+        cursor.execute("UPDATE server_metadata SET host = %s, ip = %s, group_name = %s WHERE host = %s", (new_host, new_ip, sanitize_ansible_group_name(new_group), old_host))
+        cursor.execute("UPDATE access_cache SET host = %s WHERE host = %s", (new_host, old_host))
+        cursor.execute("UPDATE ssh_key_cache SET host = %s WHERE host = %s", (new_host, old_host))
+        cursor.execute("UPDATE active_temp_keys SET host = %s WHERE host = %s", (new_host, old_host))
+    else:
+        cursor.execute("UPDATE server_metadata SET ip = %s, group_name = %s WHERE host = %s", (new_ip, sanitize_ansible_group_name(new_group), old_host))
+
+    cursor.execute("INSERT INTO sync_change_log (job_id, operator_name, host, user, change_type, previous_value, new_value, description) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                   ('INVENTORY_GEN', 'Admin', new_host, 'system', 'SERVER_UPDATED', f"{old_host}", f"{new_host} ({new_ip})", f"Updated server '{old_host}' -> Hostname: '{new_host}', IP: '{new_ip}', Group: '{new_group}'"))
+    conn.close()
+
+    reconcile_database_with_inventory()
+
+    return jsonify({
+        "status": "success",
+        "message": f"Successfully updated server '{old_host}' -> Hostname: '{new_host}', IP: '{new_ip}'",
+        "inventory": parse_inventory(INVENTORY_PATH)
+    })
+
 def reconcile_database_with_inventory():
     """Single Source of Truth Engine: Reconciles MySQL DB tables against inventory.ini.
     1. Upserts current inventory hosts into server_metadata.
@@ -2030,6 +2114,8 @@ def reconcile_database_with_inventory():
             cursor.execute("DELETE FROM access_cache")
             cursor.execute("DELETE FROM ssh_key_cache")
             cursor.execute("DELETE FROM active_temp_keys")
+
+        cursor.execute("DELETE FROM access_cache WHERE status = 'none' AND keys_count = 0")
 
         conn.close()
     except Exception as e:

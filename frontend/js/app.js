@@ -17,7 +17,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const btnAddKey          = document.getElementById('btn-add-key');
     const btnRemoveKey       = document.getElementById('btn-remove-key');
-    const btnPurgeUser       = document.getElementById('btn-purge-user');
     const btnDisableUser     = document.getElementById('btn-disable-user');
     const btnPingAll         = document.getElementById('btn-ping-all');
 
@@ -81,7 +80,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnInspectorGrant        = document.getElementById('btn-inspector-grant');
     const btnInspectorDisable      = document.getElementById('btn-inspector-disable');
     const btnInspectorEnable       = document.getElementById('btn-inspector-enable');
-    const btnInspectorPurge        = document.getElementById('btn-inspector-purge');
 
     // Stats
     const statServers        = document.getElementById('stat-servers');
@@ -358,13 +356,6 @@ document.addEventListener('DOMContentLoaded', () => {
             handleKeyDeploy('disable');
         }
     });
-    btnPurgeUser.addEventListener('click', () => {
-        const u = targetUserInput.value.trim();
-        if (!u) return alert('Enter the target username to purge.');
-        if (confirm(`PURGE ALL SSH keys for user '${u}' on selected servers?\n\nThis permanently deletes their authorized_keys. Action cannot be undone.`)) {
-            handleKeyDeploy('purge');
-        }
-    });
 
     function getSelectedHosts() {
         const chkAll  = document.getElementById('chk-all-hosts');
@@ -387,9 +378,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (!targetUser) return alert('Please enter a target username.');
         if (action === 'add' && !sshKey) return alert('Please paste the SSH public key to add.');
+        if (action === 'remove' && !sshKey) return alert('Please paste or select the SSH public key to revoke.');
 
         let finalAction = action;
-        if (action === 'remove' && !sshKey) finalAction = 'purge';
 
         setTerminalStatus('DISPATCHING', 'warning');
         terminalOutput.textContent = `[${ts()}] Dispatching ${finalAction.toUpperCase()} for user '${targetUser}' on [${targetHosts.join(', ')}]\n[${ts()}] Operator: ${operatorName} | Duration: ${duration}\n`;
@@ -621,15 +612,15 @@ document.addEventListener('DOMContentLoaded', () => {
                                 <button class="btn btn-secondary btn-xs" title="Disable access (keeps key on record, blocks SSH login)" onclick="disableUserOnHost('${user}', '${host.name}')">
                                     <i class="fa-solid fa-ban"></i> Disable
                                 </button>
-                                <button class="btn btn-danger btn-xs" title="Permanently revoke & delete SSH key" onclick="purgeUserOnHost('${user}', '${host.name}')">
-                                    <i class="fa-solid fa-trash"></i> Revoke
+                                <button class="btn btn-danger btn-xs" title="Inspect user keys to revoke specific key" onclick="openKeyInspectorModal('${host.name}', '${user}')">
+                                    <i class="fa-solid fa-trash"></i> Revoke Key
                                 </button>
                             </div>
                         </div>`;
                 });
 
-                // Disabled users (0 keys but in cache — previously had access)
-                const disabledUsers = allUsers.filter(u => !hostMatrix[u].has_access);
+                // Disabled users (explicitly blocked via .sshmanager_disabled backup)
+                const disabledUsers = allUsers.filter(u => hostMatrix[u].status === 'disabled');
                 disabledUsers.forEach(user => {
                     html += `
                         <div class="user-access-item disabled-access">
@@ -703,36 +694,7 @@ document.addEventListener('DOMContentLoaded', () => {
         .catch(err => alert(`Error: ${err.message}`));
     };
 
-    window.purgeUserOnHost = function(user, host) {
-        if (!confirm(`REVOKE & permanently delete all SSH keys for '${user}' on '${host}'?\n\nThis cannot be undone.`)) return;
 
-        // Optimistically remove from matrix
-        if (fullMatrixData.matrix && fullMatrixData.matrix[host]) {
-            delete fullMatrixData.matrix[host][user];
-            if (fullMatrixData.server_users_summary && fullMatrixData.server_users_summary[host]) {
-                fullMatrixData.server_users_summary[host] = fullMatrixData.server_users_summary[host].filter(u => u !== user);
-            }
-            renderMatrixGrid(false, null);
-        }
-
-        const operatorName = operatorNameInput.value.trim() || 'Admin';
-        fetch('/api/keys/deploy', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                target_hosts: [host],
-                target_user:  user,
-                ssh_key:      '',
-                action:       'purge',
-                comment:      'Revoked via Access Matrix',
-                operator_name: operatorName,
-                access_duration: 'permanent'
-            })
-        })
-        .then(r => r.json())
-        .then(data => { if (data.error) { alert(`Revoke failed: ${data.error}`); loadAccessMatrix(false); } })
-        .catch(err => alert(`Error: ${err.message}`));
-    };
 
     window.reenableUserOnHost = function(user, host) {
         if (!confirm(`Re-enable SSH access for '${user}' on '${host}'?\n\nThis restores their original SSH key from backup. No key paste required.`)) return;
@@ -868,7 +830,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             <strong>${escapeHtml(s.host)}</strong>
                         </div>
                     </td>
-                    <td><code>${escapeHtml(s.ip || '172.0.16.84')}</code></td>
+                    <td><code>${escapeHtml(s.ip || 'N/A')}</code></td>
                     <td>
                         <span class="badge ${envBadgeClass}" style="font-size:10px;">${escapeHtml(s.environment || 'Production')}</span>
                         <span class="badge badge-status" style="font-size:10px;">${escapeHtml(s.region || 'us-east-1')}</span>
@@ -894,7 +856,10 @@ document.addEventListener('DOMContentLoaded', () => {
                                 <i class="fa-solid fa-key"></i> Target
                             </button>
                             ${canManage ? `
-                                <button class="btn btn-outline btn-xs" style="color:var(--danger);border-color:rgba(239,68,68,0.3);" onclick="removeManagedServer('${escapeHtml(s.host)}')">
+                                <button class="btn btn-outline btn-xs" onclick="openEditServerModal('${escapeHtml(s.host)}', '${escapeHtml(s.ip)}', '${escapeHtml(s.group_name)}')">
+                                    <i class="fa-solid fa-pen-to-square"></i> Edit
+                                </button>
+                                <button class="btn btn-outline btn-xs" style="color:var(--danger);border-color:rgba(239,68,68,0.3);" title="Remove server" onclick="removeManagedServer('${escapeHtml(s.host)}')">
                                     <i class="fa-solid fa-trash"></i>
                                 </button>
                             ` : ''}
@@ -1113,12 +1078,86 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(data => {
             if (data.status === 'success') {
                 fetchInventory();
+                loadServerExplorer();
             } else {
-                alert(data.error || 'Failed to remove server');
+                alert(`Failed to remove server: ${data.message || 'Unknown error'}`);
             }
         })
-        .catch(err => alert('Error removing server: ' + err.message));
+        .catch(err => alert(`Error removing server: ${err.message}`));
     };
+
+    // Modal Edit Managed Server Handlers
+    window.openEditServerModal = function(host, ip, group) {
+        const modal = document.getElementById('modal-edit-server');
+        if (!modal) return;
+        document.getElementById('edit-server-old-host').value = host;
+        document.getElementById('edit-server-new-host').value = host;
+        document.getElementById('edit-server-new-ip').value = ip || '';
+        document.getElementById('edit-server-new-group').value = group || 'web_servers';
+        const msg = document.getElementById('edit-server-status-msg');
+        if (msg) msg.innerHTML = '';
+        modal.style.display = 'flex';
+    };
+
+    const btnCloseEditServerModal = document.getElementById('btn-close-edit-server-modal');
+    const btnCancelEditServer     = document.getElementById('btn-cancel-edit-server');
+    const btnSubmitEditServer     = document.getElementById('btn-submit-edit-server');
+    const modalEditServer         = document.getElementById('modal-edit-server');
+
+    if (btnCloseEditServerModal && modalEditServer) {
+        btnCloseEditServerModal.addEventListener('click', () => { modalEditServer.style.display = 'none'; });
+    }
+    if (btnCancelEditServer && modalEditServer) {
+        btnCancelEditServer.addEventListener('click', () => { modalEditServer.style.display = 'none'; });
+    }
+    if (btnSubmitEditServer) {
+        btnSubmitEditServer.addEventListener('click', () => {
+            const oldHost  = document.getElementById('edit-server-old-host').value.trim();
+            const newHost  = document.getElementById('edit-server-new-host').value.trim();
+            const newIp    = document.getElementById('edit-server-new-ip').value.trim();
+            const newGroup = document.getElementById('edit-server-new-group').value.trim();
+            const statusMsg = document.getElementById('edit-server-status-msg');
+
+            if (!newHost || !newIp) {
+                if (statusMsg) statusMsg.innerHTML = '<span style="color:var(--danger);font-size:12px;">Both Server Hostname and IP Address are required.</span>';
+                return;
+            }
+
+            btnSubmitEditServer.disabled = true;
+            btnSubmitEditServer.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving...';
+
+            fetch('/api/servers/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    old_host: oldHost,
+                    new_host: newHost,
+                    new_ip: newIp,
+                    new_group: newGroup
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                btnSubmitEditServer.disabled = false;
+                btnSubmitEditServer.innerHTML = '<i class="fa-solid fa-save"></i> Save Changes';
+                if (data.error) {
+                    if (statusMsg) statusMsg.innerHTML = `<span style="color:var(--danger);font-size:12px;">Error: ${escapeHtml(data.error)}</span>`;
+                } else {
+                    if (statusMsg) statusMsg.innerHTML = `<span style="color:var(--success);font-size:12px;">${escapeHtml(data.message)}</span>`;
+                    setTimeout(() => {
+                        if (modalEditServer) modalEditServer.style.display = 'none';
+                        fetchInventory();
+                        loadServerExplorer();
+                    }, 1000);
+                }
+            })
+            .catch(err => {
+                btnSubmitEditServer.disabled = false;
+                btnSubmitEditServer.innerHTML = '<i class="fa-solid fa-save"></i> Save Changes';
+                if (statusMsg) statusMsg.innerHTML = `<span style="color:var(--danger);font-size:12px;">Failed to update server: ${err.message}</span>`;
+            });
+        });
+    }
 
     /* ============================================================
        KEY AUDITOR
@@ -1304,9 +1343,6 @@ document.addEventListener('DOMContentLoaded', () => {
                         <button class="btn btn-outline btn-xs" style="border-color:var(--success);color:var(--success);" onclick="enableUserEverywhere('${user}')" title="Re-enable SSH access on all servers">
                             <i class="fa-solid fa-rotate-left"></i> Re-enable All
                         </button>
-                        <button class="btn btn-danger btn-xs" onclick="purgeUserEverywhere('${user}')" title="Permanently revoke access on all servers">
-                            <i class="fa-solid fa-trash"></i> Revoke All
-                        </button>
                     </div>
                 </div>`;
         });
@@ -1476,34 +1512,7 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     };
 
-    window.purgeUserEverywhere = function(user) {
-        if (!confirm(`PERMANENTLY REVOKE & PURGE access for user '${user}' across ALL managed servers?`)) return;
-        const hosts = (inventoryData && inventoryData.all_hosts) ? inventoryData.all_hosts.map(h => h.name) : ['all'];
-        const operatorName = operatorNameInput ? operatorNameInput.value.trim() || 'Admin' : 'Admin';
 
-        fetch('/api/keys/deploy', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                target_hosts: hosts,
-                target_user: user,
-                ssh_key: '',
-                action: 'purge',
-                comment: 'Purged via User Directory',
-                operator_name: operatorName
-            })
-        })
-        .then(r => r.json())
-        .then(data => {
-            if (data.error) alert(data.error);
-            else {
-                document.querySelector('[data-tab="tab-deploy"]').click();
-                activeJobId = data.job_id;
-                setTerminalStatus('RUNNING', 'info');
-                startLogPolling(activeJobId);
-            }
-        });
-    };
 
     /* ============================================================
        KEY INSPECTOR MODAL LOGIC
@@ -1908,14 +1917,6 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!activeInspectorUser) return;
             if (activeInspectorHost) reenableUserOnHost(activeInspectorUser, activeInspectorHost);
             else enableUserEverywhere(activeInspectorUser);
-            if (modalKeyInspector) modalKeyInspector.classList.remove('active');
-        });
-    }
-    if (btnInspectorPurge) {
-        btnInspectorPurge.addEventListener('click', () => {
-            if (!activeInspectorUser) return;
-            if (activeInspectorHost) purgeUserOnHost(activeInspectorUser, activeInspectorHost);
-            else purgeUserEverywhere(activeInspectorUser);
             if (modalKeyInspector) modalKeyInspector.classList.remove('active');
         });
     }

@@ -390,9 +390,6 @@
                                 <button type="button" class="btn btn-danger" id="btn-remove-key">
                                     <i class="fa-solid fa-trash"></i> Revoke Key
                                 </button>
-                                <button type="button" class="btn btn-warning" id="btn-purge-user">
-                                    <i class="fa-solid fa-user-slash"></i> Purge All Keys
-                                </button>
                             </div>
 
                         </form>
@@ -608,6 +605,36 @@
                 <div class="modal-footer" style="display:flex;justify-content:flex-end;gap:10px;padding:16px;">
                     <button class="btn btn-outline" id="btn-cancel-add-server">Cancel</button>
                     <button class="btn btn-primary" id="btn-submit-add-server"><i class="fa-solid fa-plus-circle"></i> Save Server(s)</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Modal: Edit Server -->
+        <div class="modal-overlay" id="modal-edit-server" style="display:none;z-index:9999;">
+            <div class="modal-card glass-card" style="max-width:560px;width:90%;">
+                <div class="modal-header" style="display:flex;justify-content:space-between;align-items:center;">
+                    <h3><i class="fa-solid fa-pen-to-square"></i> Edit Managed Server</h3>
+                    <button class="modal-close" id="btn-close-edit-server-modal" style="background:none;border:none;color:var(--text-main);font-size:20px;cursor:pointer;">&times;</button>
+                </div>
+                <div class="modal-body" style="padding:20px;">
+                    <input type="hidden" id="edit-server-old-host">
+                    <div style="margin-bottom:14px;">
+                        <label style="display:block;font-size:12px;font-weight:700;margin-bottom:6px;">Server Hostname</label>
+                        <input type="text" id="edit-server-new-host" class="input-field" placeholder="e.g. serv1_prod">
+                    </div>
+                    <div style="margin-bottom:14px;">
+                        <label style="display:block;font-size:12px;font-weight:700;margin-bottom:6px;">IP Address / FQDN</label>
+                        <input type="text" id="edit-server-new-ip" class="input-field" placeholder="e.g. 172.0.16.84 or serv1.example.com">
+                    </div>
+                    <div style="margin-bottom:14px;">
+                        <label style="display:block;font-size:12px;font-weight:700;margin-bottom:6px;">Inventory Group</label>
+                        <input type="text" id="edit-server-new-group" class="input-field" placeholder="e.g. web_servers">
+                    </div>
+                    <div id="edit-server-status-msg" style="margin-top:10px;"></div>
+                </div>
+                <div class="modal-footer" style="display:flex;justify-content:flex-end;gap:10px;padding:16px;">
+                    <button class="btn btn-outline" id="btn-cancel-edit-server">Cancel</button>
+                    <button class="btn btn-primary" id="btn-submit-edit-server"><i class="fa-solid fa-save"></i> Save Changes</button>
                 </div>
             </div>
         </div>
@@ -1255,9 +1282,6 @@
                     </button>
                     <button class="btn btn-outline btn-xs" style="border-color:var(--success);color:var(--success);" id="btn-inspector-enable" title="Restore SSH login access from backup">
                         <i class="fa-solid fa-rotate-left"></i> Re-enable Access
-                    </button>
-                    <button class="btn btn-danger btn-xs" id="btn-inspector-purge" title="Permanently delete all keys for this user">
-                        <i class="fa-solid fa-user-slash"></i> Revoke / Purge All
                     </button>
                 </div>
             </div>

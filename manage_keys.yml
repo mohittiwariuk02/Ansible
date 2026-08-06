@@ -5,7 +5,7 @@
   vars:
     target_user: "developer"      # Default target user
     ssh_key: ""                   # Public key string
-    key_state: "present"          # 'present', 'absent', 'purge_all', 'disable', 'enable'
+    key_state: "present"          # 'present', 'absent', 'disable', 'enable'
     key_comment: ""               # Comment tag
 
   tasks:
@@ -28,15 +28,6 @@
         comment: "{{ key_comment if (key_state == 'present' and key_comment | default('') != '') else omit }}"
         exclusive: false
       when: key_state in ['present', 'absent'] and ssh_key != ""
-
-    # -----------------------------------------------------------------------
-    # PURGE ALL — permanently remove authorized_keys file
-    # -----------------------------------------------------------------------
-    - name: Purge all authorized keys for target user (permanent delete)
-      ansible.builtin.file:
-        path: "{{ ('/root' if target_user == 'root' else '/home/' + target_user) + '/.ssh/authorized_keys' }}"
-        state: absent
-      when: key_state == 'purge_all'
 
     # -----------------------------------------------------------------------
     # DISABLE — rename authorized_keys → authorized_keys.sshmanager_disabled
